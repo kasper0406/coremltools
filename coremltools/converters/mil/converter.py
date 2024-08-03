@@ -108,6 +108,16 @@ class TorchFrontend:
         return load(*args, **kwargs)
 
 
+@ConverterRegistry.frontend
+class StableHloFrontend:
+    name = "stablehlo"
+
+    def __call__(self, *args, **kwargs):
+        from .frontend.stablehlo.load import load
+
+        return load(*args, **kwargs)
+
+
 @ConverterRegistry.backend
 class NNProtoBackend:
     name = "neuralnetwork"

@@ -106,13 +106,13 @@ echo "Running tests"
 
 TEST_CMD=$PYTEST_EXECUTABLE" -v -ra -W \"ignore::UserWarning\" -W \"ignore::FutureWarning\" -W \"ignore::DeprecationWarning\" -W \"ignore::ResourceWarning\" --durations=100"
 TEST_CMD+=" --junitxml="${XML_PATH}
-TEST_CMD+=" --timeout="${TIME_OUT}
+# TEST_CMD+=" --timeout="${TIME_OUT}
 TEST_CMD+=" --pyargs "${TEST_PACKAGE//,/ }
 
-IFS=',' read -A ignore_array <<< "${IGNORES}"
-for ignore in ${ignore_array[@]}; do
-    TEST_CMD+=" --ignore "${CONDA_PREFIX}"/lib/python"${PYTHON}"/site-packages/"${ignore}
-done
+#IFS=',' read -A ignore_array <<< "${IGNORES}"
+#for ignore in ${ignore_array[@]}; do
+#    TEST_CMD+=" --ignore "${CONDA_PREFIX}"/lib/python"${PYTHON}"/site-packages/"${ignore}
+#done
 
 if [[ $SLOW != 1 || $FAST != 1 ]]; then
     if [[ $SLOW == 1 ]]; then
