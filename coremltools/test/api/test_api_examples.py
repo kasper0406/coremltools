@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 import coremltools as ct
-from coremltools._deps import _HAS_TORCH
+from coremltools._deps import _HAS_TORCH, _HAS_STABLEHLO
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil import mil
 from coremltools.converters.mil.mil import Function, get_new_symbol
@@ -20,6 +20,11 @@ from coremltools.converters.mil.testing_utils import get_op_types_in_program
 
 if _HAS_TORCH:
     import torch
+
+if _HAS_STABLEHLO:
+    from jax._src.lib.mlir import ir, dialects
+    from jax._src.lib.mlir.dialects import hlo, func
+    from jax._src.interpreters import mlir as jax_mlir
 
 
 class TestMILExamples:
@@ -272,6 +277,31 @@ class TestMLProgramFP16Transform:
                 prog, convert_to="neuralnetwork", compute_precision=ct.precision.FLOAT32
             )
 
+@pytest.mark.skipif(not _HAS_STABLEHLO, reason="StableHLO not found")
+class TestStableHloEndToEnd:
+    @staticmethod
+    def test_conversion():
+        module_str = """
+            module @jit_plus attributes {jax.uses_shape_polymorphism = false, mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+                func.func public @main(%arg0: tensor<i32> {mhlo.layout_mode = "default"}, %arg1: tensor<i32> {mhlo.layout_mode = "default"}) -> (tensor<i32> {jax.result_info = "", mhlo.layout_mode = "default"}) {
+                    %0 = stablehlo.add %arg0, %arg1 : tensor<i32>
+                    return %0 : tensor<i32>
+                }
+            }
+        """
+        # context = ir.Context()
+        # context.load_all_available_dialects()
+        # context.enable_multithreading(False)
+        # context.append_dialect_registry(func.get_dialect_registry())
+        # dialects.hlo.register_dialect(context)
+
+        # TODO: Figure out a way to add the func dialect to the context...
+        with jax_mlir.make_ir_context():
+            module = ir.Module.parse(module_str)
+
+            model = ct.convert(module, convert_to="mlprogram")
+            print(f"Converted model: {model}")
+            # TODO(knielsen): Run some validation test on the model?
 
 @pytest.mark.skipif(not _HAS_TORCH, reason="PyTorch not found")
 class TestGraphPassManagement:

@@ -15,7 +15,7 @@ from coremltools import (
 from coremltools import ComputeUnit as _ComputeUnit
 from coremltools import __version__ as _ct_version
 from coremltools import _logger as logger
-from coremltools._deps import _HAS_TF_1, _HAS_TF_2, _HAS_TORCH, _HAS_TORCH_EXPORT_API
+from coremltools._deps import _HAS_TF_1, _HAS_TF_2, _HAS_TORCH, _HAS_TORCH_EXPORT_API, _HAS_STABLEHLO
 from coremltools.converters._profile_utils import _profile
 from coremltools.converters.mil._deployment_compatibility import (
     AvailableTarget,
@@ -57,6 +57,8 @@ if _HAS_TORCH:
     if _HAS_TORCH_EXPORT_API:
         from torch.export import ExportedProgram
 
+if _HAS_STABLEHLO:
+    from jax._src.lib.mlir import ir
 
 
 @_profile
@@ -1026,13 +1028,17 @@ def _determine_source(model, source,
                 )
             return "pytorch"
 
+    if source == "auto" and _HAS_STABLEHLO:
+        if isinstance(model, ir.Module):
+            return "stablehlo"
+
     if source == "auto" and isinstance(model, Program):
         return "milinternal"
 
     msg = (
         "Unable to determine the type of the model, i.e. the source framework. "
         'Please provide the value of argument "source", from one of '
-        '["tensorflow", "pytorch", "milinternal"]. Note that model conversion requires the '
+        '["tensorflow", "pytorch", "stablehlo", "milinternal"]. Note that model conversion requires the '
         "source package that generates the model. Please make sure you have "
         "the appropriate version of source package installed. E.g., if you're "
         "converting model originally trained with TensorFlow 1.14, make sure "
@@ -1118,6 +1124,9 @@ def _record_build_metadata(mlmodel, exact_source, source_dialect=None):
         src_pkg_version = "tensorflow=={0}".format(tf.__version__)
     elif exact_source == "pytorch" and _HAS_TORCH:
         src_pkg_version = "torch=={0}".format(torch.__version__)
+    elif exact_source == "stablehlo" and _HAS_STABLEHLO:
+        # TODO(knielsen): Fetch proper stablehlo version
+        src_pkg_version = "stablehlo=={0}".format("1.0.0")
     elif exact_source == 'milinternal':
         src_pkg_version = "milinternal"
     else:

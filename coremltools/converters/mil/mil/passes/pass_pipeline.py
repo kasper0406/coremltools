@@ -167,6 +167,10 @@ _FRONTEND_TF2_PASSES: List[Text] = [
     "tensorflow::expand_tf_lstm",
 ]
 
+_FRONTEND_STABLEHLO_PASSES: List[Text] = [
+    
+]
+
 _BACKEND_MIL_PASSES: List[Text] = [
     "common::const_elimination",
     "mil_backend::adjust_io_to_supported_types",
@@ -270,6 +274,7 @@ class PassPipeline:
         "frontend_pytorch": _FRONTEND_TORCH_PASSES,
         "frontend_tensorflow": _FRONTEND_TF1_PASSES,
         "frontend_tensorflow2": _FRONTEND_TF2_PASSES,
+        "frontend_stablehlo": _FRONTEND_STABLEHLO_PASSES,
         # Backend pipelines.
         "backend_mlprogram": _BACKEND_MIL_PASSES,
         "backend_neuralnetwork": _BACKEND_NN_PASSES,

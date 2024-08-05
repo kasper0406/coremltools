@@ -210,3 +210,10 @@ def version_ge(module, target_version):
 def version_lt(module, target_version):
     """See version_ge"""
     return Version(module.__version__) < Version(target_version)
+
+# ---------------------------------------------------------------------------------------
+_HAS_STABLEHLO = True
+try:
+    from jax._src.lib.mlir import ir
+except:
+    _HAS_STABLEHLO = False
