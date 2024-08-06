@@ -12,9 +12,10 @@ from coremltools.converters.mil.testing_utils import compare_backend
 
 def test_addition():
     def plus(x, y):
-        return jnp.add(x,y)
+        return jnp.add(x, y)
 
-    run_and_compare(plus, (jnp.float32(1), jnp.float32(1),))
+    run_and_compare(plus, (jnp.float32(1), jnp.float32(1)))
+    run_and_compare(plus, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
 
 def jax_export(jax_func, input_spec):
     input_shapes = [jax.ShapeDtypeStruct(input.shape, input.dtype) for input in input_spec]
@@ -32,6 +33,7 @@ def run_and_compare(jax_func, input_spec):
     exported = jax_export(jax_func, input_spec)
     context = jax_mlir.make_ir_context()
     hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
+    # print(f"HLO module: {hlo_module}")
 
     cml_model = ct.convert(hlo_module)
 
@@ -43,7 +45,7 @@ def run_and_compare(jax_func, input_spec):
         input_value = generate_random_from_shape(input_shape, value_key)
         cml_input_key_values[input_name] = input_value
         jax_input_values.append(input_value)
-    
+
     expected_output = jax_func(*jax_input_values)
     
     # TODO(knielsen): Is there a nicer way of doing this?
