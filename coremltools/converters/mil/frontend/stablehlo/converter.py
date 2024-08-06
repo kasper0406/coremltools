@@ -5,9 +5,11 @@ from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
 from coremltools.converters.mil.input_types import TensorType
 
-from jax._src.lib.mlir import ir
+from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp
+
+import numpy as np
 
 from typing import Dict
 import inspect
@@ -152,13 +154,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     raise ValueError("More than 1 return op in block!")
                 outputs = ret
         return outputs
-    
-    @register_stablehlo_op
-    def op_add(self, context: TranscriptionContext, op: AddOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_op = mb.add(x=lhs, y=rhs)
-        context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
     def op_call(self, context: TranscriptionContext, op: CallOp):
@@ -189,6 +184,73 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_return(self, context: TranscriptionContext, op: ReturnOp):
         return [ context[result.get_name()] for result in op.operands ]
+
+    @register_stablehlo_op
+    def op_add(self, context: TranscriptionContext, op: AddOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_op = mb.add(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_op)
+    
+    @register_stablehlo_op
+    def op_constant(self, context: TranscriptionContext, op: ConstantOp):
+        constant = np.array(op.value)
+        context.add_variable(op.result.get_name(), constant)
+
+    @register_stablehlo_op
+    def op_dot_general(self, context: TranscriptionContext, op: DotGeneralOp):
+        lhs_rank = len(op.lhs.type.shape)
+        rhs_rank = len(op.rhs.type.shape)
+        dims = self.__hacky_parse_attribute(op.dot_dimension_numbers)
+        contract_lhs = [ int(d.strip()) for d in dims["lhs_contracting_dimensions"].strip("[]").split(",") ]
+        contract_rhs = [ int(d.strip()) for d in dims["rhs_contracting_dimensions"].strip("[]").split(",") ]
+
+        if len(contract_lhs) == 1 and contract_lhs[0] == lhs_rank - 1 and len(contract_rhs) == 1 and contract_rhs[0] == rhs_rank - 2:
+            # This special case corresponds to CoreML matmul
+            lhs = context[op.lhs.get_name()]
+            rhs = context[op.rhs.get_name()]
+            matmul_res = mb.matmul(x=lhs, y=rhs)
+            context.add_variable(op.result.get_name(), matmul_res)
+            return
+        
+        raise ValueError(f"The specified DotGeneral operation is not supported: {op}")
+
+    @register_stablehlo_op
+    def op_reshape(self, context: TranscriptionContext, op: ReshapeOp):
+        x = context[op.operand.get_name()]
+        new_shape = op.result.type.shape
+        reshape_res = mb.reshape(x=x, shape=new_shape)
+        context.add_variable(op.result.get_name(), reshape_res)
+
+    @register_stablehlo_op
+    def op_broadcast_in_dim(self, context: TranscriptionContext, op: BroadcastInDimOp):
+        # TODO(knielsen): Consider if this is actually correct!
+        # CoreML seems to auto-broadcast along the lines of numpy. Therefore this
+        # explicit broadcasting op is not necessary.
+        x = context[op.operand.get_name()]
+        context.add_variable(op.result.get_name(), x)
+
+    # TODO(knielsen): Figure out a way to get rid of this!!!
+    def __hacky_parse_attribute(self, attr: ir.Attribute):
+        attr_str = str(attr)
+        start = attr_str.find("<")
+        end = attr_str.rfind(">")
+        if start == -1 or end == -1:
+            return {}
+
+        attr_str = attr_str[(start + 1):end]
+    
+        attributes = {}
+        # Split the string by comma to separate each key-value pair
+        for attribute in attr_str.split(','):
+            # Split by '=' to separate keys and values
+            key, value = attribute.split('=')
+            # Remove extra spaces and strip brackets
+            key = key.strip()
+            value = value.strip()
+            attributes[key] = value
+        
+        return attributes
 
     def __get_dtype(self, element_type):
         if isinstance(element_type, ir.IntegerType):
