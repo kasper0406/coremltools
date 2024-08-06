@@ -1,3 +1,4 @@
+import jax
 from flax import nnx
 import jax.numpy as jnp
 
@@ -34,4 +35,31 @@ def test_flax_stacked_linear():
             return out
     
     model = TestStackedLinear(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((2, 2)), ))
+
+def test_flax_stacked_lax_scan():
+    class TestStackedLaxScanLinear(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            @partial(nnx.vmap, axis_size=3) # 3 hidden layers
+            def create_hidden_layers(rngs: nnx.Rngs):
+                return nnx.Linear(in_features=4, out_features=4, bias_init=nnx.initializers.ones, rngs=rngs)
+            self.hidden_layers = create_hidden_layers(rngs)
+
+            self.upscale_layer = nnx.Linear(in_features=2, out_features=4, bias_init=nnx.initializers.ones, rngs=rngs)
+            self.downscale_layer = nnx.Linear(in_features=4, out_features=2, bias_init=nnx.initializers.ones, rngs=rngs)
+
+        def __call__(self, x):
+            out = self.upscale_layer(x)
+
+            layer_def, layer_states = nnx.split(self.hidden_layers)
+            def forward(x, layer_state):
+                layer = nnx.merge(layer_def, layer_state)
+                x = layer(x)
+                return x, None
+            out, _ = jax.lax.scan(forward, out, layer_states)
+
+            out = self.downscale_layer(out)
+            return out
+
+    model = TestStackedLaxScanLinear(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((2, 2)), ))

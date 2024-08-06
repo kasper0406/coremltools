@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, SelectOp, DynamicSliceOp
 
 import numpy as np
 
@@ -161,21 +161,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Get the argument mapping prior to entering the function context
         context_args = []
+
         for arg in op.operands:
             context_args.append(context[arg.get_name()])
 
-        ctx_name = context.push_function(op.callee.value)
-
-        # Set up parameter to argument mapping
-        hlo_func = self.func_index[ctx_name]
-        # Setup arguments for the function
-        for hlo_func_param, actual_arg in zip(hlo_func.arguments, context_args):
-            context.add_variable(hlo_func_param.get_name(), actual_arg)
-
-        # Process the function
-        outputs = self.process_block(context, hlo_func.body.blocks[0])
-
-        context.pop_function()
+        func_name = op.callee.value
+        hlo_func = self.func_index[op.callee.value]
+        params = hlo_func.arguments
+        outputs = self.__invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
 
         # Configure return value
         for result, output in zip(op.results, outputs):
@@ -191,7 +184,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs = context[op.rhs.get_name()]
         cml_op = mb.add(x=lhs, y=rhs)
         context.add_variable(op.result.get_name(), cml_op)
-    
+
     @register_stablehlo_op
     def op_constant(self, context: TranscriptionContext, op: ConstantOp):
         constant = np.array(op.value)
@@ -229,6 +222,45 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # explicit broadcasting op is not necessary.
         x = context[op.operand.get_name()]
         context.add_variable(op.result.get_name(), x)
+
+    @register_stablehlo_op
+    def op_while(self, context: TranscriptionContext, op: WhileOp):
+        def cond(*loop_args):
+            params = [ param for param in op.cond.blocks[0].arguments ]
+            outputs = self.__invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
+            if len(outputs) != 1:
+                raise ValueError("The output of while_cond should always be a single boolean!")
+            # TODO(knielsen): Add a check that the output is in fact a single boolean value
+
+            return outputs[0]
+        
+        def body(*body_args):
+            params = [ param for param in op.body.blocks[0].arguments ]
+            return self.__invoke_hlo_function(context, "while_body", params, op.body, body_args)
+
+        loop_vars = [ context[arg.get_name()] for arg in op.operands ]
+        while_result = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
+
+        for res in op.results:
+            context.add_variable(res.get_name(), while_result)
+
+    def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
+        # Enter variable context for the function call
+        context.push_function(func_name)
+
+        # Setup arguments for the function
+        for hlo_func_param, actual_arg in zip(hlo_params, cml_args):
+            context.add_variable(hlo_func_param.get_name(), actual_arg)
+        
+        # Process the function
+        if len(hlo_func_body.blocks) != 1:
+            raise ValueError(f"Unsupported function with {len(hlo_func_body.blocks)} blocks")
+        outputs = self.process_block(context, hlo_func_body.blocks[0])
+
+        # Exit the function context
+        context.pop_function()
+
+        return outputs
 
     # TODO(knielsen): Figure out a way to get rid of this!!!
     def __hacky_parse_attribute(self, attr: ir.Attribute):
