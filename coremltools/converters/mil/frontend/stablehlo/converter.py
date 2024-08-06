@@ -6,8 +6,8 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
-from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, SelectOp, DynamicSliceOp
+from jaxlib.mlir.dialects.func import FuncOp, CallOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp
 
 import numpy as np
 
@@ -244,6 +244,31 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         for res in op.results:
             context.add_variable(res.get_name(), while_result)
 
+    @register_stablehlo_op
+    def op_compare(self, context: TranscriptionContext, op: CompareOp):
+        comparison_direction = self.__hacky_parse_attribute(op.comparison_direction)["comparison_direction"]
+        cml_op_builder = {
+            "EQ": mb.equal,
+            "NE": mb.not_equal,
+            "GE": mb.greater_equal,
+            "GT": mb.greater,
+            "LE": mb.less_equal,
+            "LT": mb.less,
+        }[comparison_direction]
+
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_op = cml_op_builder(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_convert(self, context: TranscriptionContext, op: ConvertOp):
+        x = context[op.operand.get_name()]
+        new_dtype = self.__get_dtype(op.result.type.element_type)
+        cml_op = mb.cast(x=x, dtype=self.__dtype_str(new_dtype))
+        context.add_variable(op.result.get_name(), cml_op)
+
+
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
         context.push_function(func_name)
@@ -275,17 +300,31 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         attributes = {}
         # Split the string by comma to separate each key-value pair
         for attribute in attr_str.split(','):
-            # Split by '=' to separate keys and values
-            key, value = attribute.split('=')
+            if "=" in attribute:
+                # Split by '=' to separate keys and values
+                key, value = attribute.split('=')
+            else:
+                # Assume space seperated
+                key, value = attribute.split(' ')
+        
             # Remove extra spaces and strip brackets
             key = key.strip()
             value = value.strip()
             attributes[key] = value
-        
+
         return attributes
+
+    def __dtype_str(self, type):
+        # TODO(knielsen): Add additional types
+        return {
+            types.int32: "int32",
+            types.fp16: "fp16",
+            types.fp32: "fp32",
+        }[type]
 
     def __get_dtype(self, element_type):
         if isinstance(element_type, ir.IntegerType):
+            # TODO(knielsen): Handle different kinds of integer types
             return types.int32
         if isinstance(element_type, ir.F16Type):
             return types.fp16
