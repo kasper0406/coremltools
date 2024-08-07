@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, ExpOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp
 
 import numpy as np
 
@@ -202,6 +202,56 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
+    def op_subtract(self, context: TranscriptionContext, op: SubtractOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_op = mb.sub(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_mul(self, context: TranscriptionContext, op: MulOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_op = mb.mul(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_div(self, context: TranscriptionContext, op: DivOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+
+        # From HLO constraints we know the base-types should line up
+        lhs_type = self.__resolve_type(lhs)
+        rhs_type = self.__resolve_type(rhs)
+        if lhs_type != rhs_type:
+            raise ValueError(f"Division not supported for different types. lhs type: {lhs_type}, rhs type: {rhs_type}")
+        if types.is_complex(lhs_type):
+            raise ValueError("Complex numbers are not supported in MIL")
+
+        if types.is_float(lhs_type):
+            cml_op = mb.real_div(x=lhs, y=rhs)
+        elif types.is_int(lhs_type):
+            cml_op = mb.floor_div(x=lhs, y=rhs)
+        else:
+            raise ValueError(f"Unknown dtype {lhs_type}")
+
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_neg(self, context: TranscriptionContext, op: NegOp):
+        # TODO(knielsen): Consider unsigned and more exotic types
+        operand = context[op.operand.get_name()]
+        minus_one = np.array([-1], dtype=types.nptype_from_builtin(operand.dtype))
+        cml_op = mb.mul(x=minus_one, y=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_exp(self, context: TranscriptionContext, op: ExpOp):
+        operand = context[op.operand.get_name()]
+        cml_op = mb.exp(x=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
     def op_constant(self, context: TranscriptionContext, op: ConstantOp):
         constant = np.array(op.value)
         context.add_variable(op.result.get_name(), constant)
@@ -333,36 +383,61 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         perm.append(perm.pop(1))
         x = mb.transpose(x=x, perm=perm)
 
-        # The MIL weights should be on form [C_out, C_in / groups, Kernel*]
-        # HLO has the form [Kernel*, C_in / groups, C_out]
-        weight = context[op.rhs.get_name()] # The weights are numpy arrays
-        perm = []
-        for i in range(len(weight.shape) - 2):
-            # Kernel perms moved to after the channels
-            perm.append(2 + i)
-        # Move the channel dims
-        perm.append(1)
-        perm.append(0)
-        weight = mb.transpose(x=weight, perm=perm)
+        strides = None
+        if op.window_strides is not None:
+            strides = np.array(op.window_strides, dtype=np.int32)
 
-        strides = op.window_strides # TODO(knielsen): Test this
-        dilations = op.lhs_dilation # TODO(knielsen): Test this
+        kernel_dilation = None
+        if op.rhs_dilation is not None:
+            kernel_dilation = np.array(op.rhs_dilation, dtype=np.int32)
+
         groups = op.feature_group_count.value
 
         # Handle padding
-        # TODO(knielsen): Consider moving splat/non-splat handlign to some utility
+        # TODO(knielsen): Consider moving splat/non-splat handling to some utility
         in_rank = x.rank - 2
-        if not op.padding.is_splat:
-            raise ValueError(f"Onlt splat-values (all elements are the same) for padding is currently supported. Got {np.array(op.padding)}")
-        pad = op.padding.get_splat_value().value * np.ones((2 * in_rank), dtype=np.int32)
+        if op.padding is None:
+            pad = np.zeros((2 * in_rank), dtype=np.int32)
+        elif op.padding.is_splat:
+            pad = op.padding.get_splat_value().value * np.ones((2 * in_rank), dtype=np.int32)
+        else:
+            # We need to reshape the array to a linear array to match MILs expectation
+            pad = np.reshape(np.array(op.padding, dtype=np.int32), (2 * in_rank, ))
 
-        cml_conv = mb.conv(
+        # We switch the convolution to a transposed convolution if we have lhs_dilation
+        conv_type = mb.conv
+        if op.lhs_dilation is not None:
+            if strides is not None:
+                raise ValueError("For a conv with lhs dilation we expect the stride to be not set! Because convolution with input dilation d is equivalent to transposed convolution with stride d.")
+            # Convolution with input dilation d is equivalent to transposed convolution with stride d
+            strides = np.array(op.lhs_dilation, dtype=np.int32)
+            conv_type = mb.conv_transpose
+
+        # The MIL weights should be on form:
+        #  - normal convolutions: [C_out, C_in / groups, Kernel*]
+        #  - transposed convolutions: [C_in, C_out / groups, Kernel*]
+        # HLO has the form [Kernel*, C_in / groups, C_out]
+        weight = context[op.rhs.get_name()] # The weights are numpy arrays
+        perm = []
+        # Move the channel dims
+        if conv_type == mb.conv:
+            perm.append(len(weight.shape) - 1)
+            perm.append(len(weight.shape) - 2)
+        else:
+            perm.append(len(weight.shape) - 2)
+            perm.append(len(weight.shape) - 1)
+        for i in range(len(weight.shape) - 2):
+            # Kernel perms moved to after the channels
+            perm.append(i)
+        weight = mb.transpose(x=weight, perm=perm)
+
+        cml_conv = conv_type(
             x=x,
             weight=weight,
             strides=strides,
             pad_type="custom",
             pad=pad,
-            dilations=dilations,
+            dilations=kernel_dilation,
             groups=groups,
         )
 
@@ -383,6 +458,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         cml_res = mb.maximum(x=lhs, y=rhs)
         context.add_variable(op.result.get_name(), cml_res)
 
+    @register_stablehlo_op
+    def op_rsqrt(self, context: TranscriptionContext, op: RsqrtOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.rsqrt(x=x)
+        context.add_variable(op.result.get_name(), mil_res)
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
@@ -440,6 +520,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             weights_dim=lists[1],
             out_dim=lists[2],
         )
+
+    def __resolve_type(self, obj):
+        if isinstance(obj, np.ndarray):
+            return types.numpy_type_to_builtin_type(obj.dtype)
+        return obj.dtype
 
     def __dtype_str(self, type):
         # TODO(knielsen): Add additional types

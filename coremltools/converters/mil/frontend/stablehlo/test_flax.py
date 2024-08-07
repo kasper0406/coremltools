@@ -3,6 +3,7 @@ from flax import nnx
 import jax.numpy as jnp
 
 from functools import partial
+from typing import Optional
 
 from coremltools.converters.mil.frontend.stablehlo.test.test_jax import run_and_compare
 
@@ -95,3 +96,88 @@ def test_flax_stacked_convolution():
 
     model = TestStackedConvolution(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((3, 8, 2)), ))
+
+def test_flax_transposed_convolution():
+    class TestTransposedConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=2, out_features=3, kernel_size=4, rngs=rngs)
+            self.conv_transpose = nnx.ConvTranspose(in_features=3, out_features=2, kernel_size=3, rngs=rngs)
+
+        def __call__(self, x):
+            x = self.conv(x)
+            x = self.conv_transpose(x)
+            return x
+
+    model = TestTransposedConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 2)), ))
+
+def test_dilated_conv():
+    class DilatedConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=2, out_features=3, kernel_size=4, kernel_dilation=2, rngs=rngs)
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    model = DilatedConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 2)), ))
+
+class ResidualConv(nnx.Module):
+    scale_conv: nnx.Conv
+    conv: nnx.Conv
+    normalization_1: nnx.Module
+    normalization_2: nnx.Module
+    normalization_3: nnx.Module
+    shortcut: nnx.Conv
+
+    def __init__(self, in_channels: int, out_channels: int, rngs: nnx.Rngs, stride: int = 2):
+        conv_type = nnx.Conv if in_channels <= out_channels else nnx.ConvTranspose
+
+        kernel_size = 4
+        self.scale_conv = conv_type(
+            in_features=in_channels,
+            out_features=out_channels,
+            kernel_size=(kernel_size,),
+            strides=(stride,),
+            rngs=rngs
+        )
+        self.conv = nnx.Conv(
+            in_features=out_channels,
+            out_features=out_channels,
+            kernel_size=kernel_size,
+            rngs=rngs,
+        )
+
+        self.normalization_1 = nnx.BatchNorm(num_features=out_channels, rngs=rngs)
+        self.normalization_2 = nnx.BatchNorm(num_features=out_channels, rngs=rngs)
+
+        self.shortcut = conv_type(
+            in_features=in_channels,
+            out_features=out_channels,
+            kernel_size=(stride,),
+            strides=(stride,),
+            rngs=rngs
+        )
+
+    def __call__(self, x):
+        out = self.scale_conv(x)
+        out = self.normalization_1(out)
+        out = nnx.silu(out)
+
+        out = self.conv(out)
+        out = nnx.silu(out)
+
+        # Residual
+        out = out + self.shortcut(x)
+        out = self.normalization_2(out)
+
+        return out
+
+def test_flax_residual_conv_module():
+    # model_upscale = ResidualConv(in_channels=2, out_channels=4, rngs=nnx.Rngs(0))
+    # model_upscale.eval()
+    # run_and_compare(nnx.jit(model_upscale), (jnp.zeros((4, 8, 2)), ))
+
+    model_downscale = ResidualConv(in_channels=4, out_channels=2, rngs=nnx.Rngs(0))
+    model_downscale.eval()
+    run_and_compare(nnx.jit(model_downscale), (jnp.zeros((4, 4, 4)), ))
