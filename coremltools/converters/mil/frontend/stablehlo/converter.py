@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp
 
 import numpy as np
 
@@ -375,6 +375,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         cml_conv = mb.transpose(x=cml_conv, perm=perm)
 
         context.add_variable(op.result.get_name(), cml_conv)
+
+    @register_stablehlo_op
+    def op_max(self, context: TranscriptionContext, op: MaxOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_res = mb.maximum(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_res)
+
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call

@@ -74,3 +74,24 @@ def test_flax_convolution():
 
     model = TestConvolution(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((2, 8, 2)), ))
+
+def test_flax_stacked_convolution():
+    class TestStackedConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            @partial(nnx.vmap, axis_size=3) # 3 hidden layers
+            def create_convs(rngs: nnx.Rngs):
+                return nnx.Conv(in_features=2, out_features=2, kernel_size=3, rngs=rngs)
+            self.conv_layers = create_convs(rngs)
+
+        def __call__(self, x):
+            layer_def, layer_states = nnx.split(self.conv_layers)
+            def forward(x, layer_state):
+                layer = nnx.merge(layer_def, layer_state)
+                x = layer(x)
+                x = nnx.relu(x)
+                return x, None
+            out, _ = jax.lax.scan(forward, x, layer_states)
+            return out
+
+    model = TestStackedConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((3, 8, 2)), ))
