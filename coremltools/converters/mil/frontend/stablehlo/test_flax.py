@@ -63,3 +63,14 @@ def test_flax_stacked_lax_scan():
 
     model = TestStackedLaxScanLinear(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((2, 2)), ))
+
+def test_flax_convolution():
+    class TestConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=2, out_features=1, kernel_size=3, rngs=rngs)
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    model = TestConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((2, 8, 2)), ))

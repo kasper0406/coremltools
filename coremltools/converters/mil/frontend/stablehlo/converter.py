@@ -7,12 +7,14 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp
 
 import numpy as np
 
-from typing import Dict
+from typing import Dict, List
 import inspect
+from dataclasses import dataclass
+import re
 
 class TranscriptionContext:
     def __init__(self):
@@ -100,6 +102,13 @@ class StableHloOpsRegistry(type):
         instance = super().__call__(*args, **kwargs)
         setattr(instance, 'dispatch_op', cls._dispatch_op)
         return instance
+
+@dataclass
+class ConvDimensions:
+    in_dim: List
+    weights_dim: List
+    out_dim: List
+
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
 
@@ -300,6 +309,73 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         cml_op = mb.slice_by_size(x=x, begin=begin, size=sizes)
         context.add_variable(op.result.get_name(), cml_op)
 
+    @register_stablehlo_op
+    def op_convolution(self, context: TranscriptionContext, op: ConvolutionOp):
+        # TODO(knielsen): Support additional dimension specifications
+        dim_spec = self.__hacky_parse_conv_dimensions(op.dimension_numbers)
+        if dim_spec.in_dim[0] != "b" or dim_spec.out_dim[0] != "b":
+            raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
+        if dim_spec.in_dim[1] != "0" or dim_spec.out_dim[1] != "0" or dim_spec.weights_dim[0] != "0":
+            raise ValueError(f"This must currently be 0. Not totally sure what it exactly means. Got {dim_spec}")
+        if dim_spec.weights_dim[-1] != "o":
+            raise ValueError(f"The output channels dim must be the last weight dimension. Got {dim_spec}")
+        if dim_spec.weights_dim[-2] != "i":
+            raise ValueError(f"The input channels dim must be the second last weight dimension. Got {dim_spec}")
+
+        if op.batch_group_count.value != 1:
+            raise ValueError(f"Only a batch group count of 1 is supported. Got {op.batch_group_count.value}")
+
+        # The op.lhs has dimension [batch, d_in*, channels]
+        # MIL expects it on the form [batch, channels, d_in*]
+        x = context[op.lhs.get_name()] # The inputs comes from vars
+        perm = list(range(x.rank))
+        # Move the second axis to the end
+        perm.append(perm.pop(1))
+        x = mb.transpose(x=x, perm=perm)
+
+        # The MIL weights should be on form [C_out, C_in / groups, Kernel*]
+        # HLO has the form [Kernel*, C_in / groups, C_out]
+        weight = context[op.rhs.get_name()] # The weights are numpy arrays
+        perm = []
+        for i in range(len(weight.shape) - 2):
+            # Kernel perms moved to after the channels
+            perm.append(2 + i)
+        # Move the channel dims
+        perm.append(1)
+        perm.append(0)
+        weight = mb.transpose(x=weight, perm=perm)
+
+        strides = op.window_strides # TODO(knielsen): Test this
+        dilations = op.lhs_dilation # TODO(knielsen): Test this
+        groups = op.feature_group_count.value
+
+        # Handle padding
+        # TODO(knielsen): Consider moving splat/non-splat handlign to some utility
+        in_rank = x.rank - 2
+        if not op.padding.is_splat:
+            raise ValueError(f"Onlt splat-values (all elements are the same) for padding is currently supported. Got {np.array(op.padding)}")
+        pad = op.padding.get_splat_value().value * np.ones((2 * in_rank), dtype=np.int32)
+
+        cml_conv = mb.conv(
+            x=x,
+            weight=weight,
+            strides=strides,
+            pad_type="custom",
+            pad=pad,
+            dilations=dilations,
+            groups=groups,
+        )
+
+        # Re-arrange output dimensions to match expectation
+        # MIL outputs on the form [batch, channels, d_in*]
+        # In the HLO program we expect [batch, d_in*, channels]
+        perm = list(range(x.rank))
+        # Move the second axis to the end
+        perm.append(perm.pop(1))
+        cml_conv = mb.transpose(x=cml_conv, perm=perm)
+
+        context.add_variable(op.result.get_name(), cml_conv)
+
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
         context.push_function(func_name)
@@ -344,6 +420,18 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             attributes[key] = value
 
         return attributes
+
+    def __hacky_parse_conv_dimensions(self, attr):
+        # Example form: #stablehlo.conv<[b, 0, f]x[0, i, o]->[b, 0, f]>
+        s = str(attr)
+
+        matches = re.findall(r'\[([^\[\]]+)\]', s)
+        lists = [ match.split(', ') for match in matches ]
+        return ConvDimensions(
+            in_dim=lists[0],
+            weights_dim=lists[1],
+            out_dim=lists[2],
+        )
 
     def __dtype_str(self, type):
         # TODO(knielsen): Add additional types
