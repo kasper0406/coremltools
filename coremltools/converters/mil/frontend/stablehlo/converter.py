@@ -6,7 +6,7 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
-from jaxlib.mlir.dialects.func import FuncOp, CallOp
+from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import AddOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp
 
 import numpy as np
@@ -179,6 +179,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         return [ context[result.get_name()] for result in op.operands ]
 
     @register_stablehlo_op
+    def op_func_return(self, context: TranscriptionContext, op: FuncReturnOp):
+        # The HLO / MLIR types for function return ops seem to be both in use
+        # The behaviour and fields of the two types should be similar, so we
+        # simply delegate to the HLO version
+        return self.op_return(context, op)
+
+    @register_stablehlo_op
     def op_add(self, context: TranscriptionContext, op: AddOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
@@ -239,10 +246,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             return self.__invoke_hlo_function(context, "while_body", params, op.body, body_args)
 
         loop_vars = [ context[arg.get_name()] for arg in op.operands ]
-        while_result = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
+        while_results = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
 
-        for res in op.results:
-            context.add_variable(res.get_name(), while_result)
+        for result_var, while_result in zip(op.results, while_results):
+            context.add_variable(result_var.get_name(), while_result)
 
     @register_stablehlo_op
     def op_compare(self, context: TranscriptionContext, op: CompareOp):
@@ -268,6 +275,30 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         cml_op = mb.cast(x=x, dtype=self.__dtype_str(new_dtype))
         context.add_variable(op.result.get_name(), cml_op)
 
+    @register_stablehlo_op
+    def op_select(self, context: TranscriptionContext, op: SelectOp):
+        cond = context[op.pred.get_name()]
+        a = context[op.on_true.get_name()]
+        b = context[op.on_false.get_name()]
+        cml_op = mb.select(cond=cond, a=a, b=b)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_dynamic_slice(self, context: TranscriptionContext, op: DynamicSliceOp):
+        x = context[op.operand.get_name()]
+
+        # The HLO DynamicSliceOp gives the start indices as seperate 0-dimensional integer variables
+        # We need to convert them to a tensor to be compatible with mb.slice_by_size
+        start_idx_variables = [ context[i.get_name()] for i in op.start_indices ]
+        begin = mb.concat(values=start_idx_variables, axis=0)
+
+        # The slice sizes in HLO are given by a signed integer with 64 bits
+        # This is not supported by MIL, so we convert it to a MIL int32 type
+        # TODO(knielsen): Overflow check?
+        sizes = np.array(op.slice_sizes, dtype=np.int32)
+
+        cml_op = mb.slice_by_size(x=x, begin=begin, size=sizes)
+        context.add_variable(op.result.get_name(), cml_op)
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call

@@ -269,6 +269,8 @@ class merge_consecutive_reshapes(AbstractGraphPass):
 
     @block_context_manager
     def _merge_consecutive_reshapes_block(self, block):
+        # We need to nested function to update the builder block!
+        @block_context_manager
         def help_merge_consecutive_reshapes_block(block):
             fusion_happens = False
             for op in list(block.operations):
