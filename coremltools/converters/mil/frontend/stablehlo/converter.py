@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp
 
 import numpy as np
 
@@ -282,6 +282,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
+    def op_sqrt(self, context: TranscriptionContext, op: SqrtOp):
+        operand = context[op.operand.get_name()]
+        cml_op = mb.sqrt(x=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
     def op_constant(self, context: TranscriptionContext, op: ConstantOp):
         constant = np.array(op.value)
         context.add_variable(op.result.get_name(), constant)
@@ -291,17 +297,76 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs_rank = len(op.lhs.type.shape)
         rhs_rank = len(op.rhs.type.shape)
         dims = self.__hacky_parse_attribute(op.dot_dimension_numbers)
-        contract_lhs = [ int(d.strip()) for d in dims["lhs_contracting_dimensions"].strip("[]").split(",") ]
-        contract_rhs = [ int(d.strip()) for d in dims["rhs_contracting_dimensions"].strip("[]").split(",") ]
 
-        if len(contract_lhs) == 1 and contract_lhs[0] == lhs_rank - 1 and len(contract_rhs) == 1 and contract_rhs[0] == rhs_rank - 2:
+        def parse_dim(key: str):
+            if key not in dims:
+                return []
+            return [ int(d.strip()) for d in dims[key].strip("[]").split(",") ]
+
+        contract_lhs = parse_dim("lhs_contracting_dimensions")
+        contract_rhs = parse_dim("rhs_contracting_dimensions")
+        batching_lhs = parse_dim("lhs_batching_dimensions")
+        batching_rhs = parse_dim("rhs_batching_dimensions")
+
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+
+        if len(contract_lhs) == 1 and contract_lhs[0] == lhs_rank - 1 and len(contract_rhs) == 1 and contract_rhs[0] == rhs_rank - 2 and len(batching_lhs) == 0 and len(batching_rhs) == 0:
             # This special case corresponds to CoreML matmul
-            lhs = context[op.lhs.get_name()]
-            rhs = context[op.rhs.get_name()]
             matmul_res = mb.matmul(x=lhs, y=rhs)
             context.add_variable(op.result.get_name(), matmul_res)
             return
-        
+        if batching_lhs == [0] and batching_rhs == [0]:
+            if len(contract_lhs) == 0 and len(contract_rhs) == 0:
+                # This is the full outer product apart from the batch dim
+                if lhs_rank == 1:
+                    # This is a simple scalar multiplication with a re-shape
+                    new_shape = [lhs.shape[0]] + [1] * (rhs_rank - 1)
+                    reshaped = mb.reshape(x=lhs, shape=new_shape)
+                    res = mb.mul(x=reshaped, y=rhs)
+                    context.add_variable(op.result.get_name(), res)
+                    return
+                if rhs_rank == 1:
+                    # This is a simple scalar multiplication with a re-shape
+                    new_shape = [rhs.shape[0]] + [1] * (lhs_rank - 1)
+                    reshaped = mb.reshape(x=rhs, shape=new_shape)
+                    res = mb.mul(x=lhs, y=reshaped)
+                    context.add_variable(op.result.get_name(), res)
+                    return
+                
+                # Unfortunately MIL is quite limited in its einsum implementation
+                # We handle some simple cases that will get the job done for now
+                if lhs_rank == 2 and rhs_rank == 2:
+                    # This is the outer product apart from the batch dim.
+                    # We express this with mat-mul and reshapes, as MIL's einsum implementation is very limited
+                    lhs_reshaped = mb.reshape(x=lhs, shape=(lhs.shape[0], lhs.shape[1], 1))
+                    rhs_reshaped = mb.reshape(x=rhs, shape=(rhs.shape[0], 1, rhs.shape[1]))
+                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
+            if contract_lhs == [1] and contract_rhs == [1]:
+                if lhs_rank == 2 and rhs_rank == 2:
+                    # In this case this is the full inner product apart from the batch dim
+                    # Again we can utilize some reshapes
+                    lhs_reshaped = mb.reshape(x=lhs, shape=(lhs.shape[0], 1, lhs.shape[1]))
+                    rhs_reshaped = mb.reshape(x=rhs, shape=(rhs.shape[0], rhs.shape[1], 1))
+                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
+                    # Ensure that our dimensions are contracted
+                    res = mb.reshape(x=res, shape=(lhs.shape[0],))
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
+            if contract_lhs == [2] and contract_rhs == [1]:
+                if lhs_rank == 3 and rhs_rank == 2:
+                    # This is a matrix to vector multiplication up to the batch dim
+                    rhs_reshaped = mb.reshape(x=rhs, shape=(rhs.shape[0], rhs.shape[1], 1))
+                    res = mb.matmul(x=lhs, y=rhs_reshaped)
+                    # Ensure that our dimensions are contracted
+                    res = mb.reshape(x=res, shape=(lhs.shape[0], lhs.shape[1]))
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
         raise ValueError(f"The specified DotGeneral operation is not supported: {op}")
 
     @register_stablehlo_op
