@@ -133,6 +133,37 @@ def test_strided_conv_transpose():
     model = StridedConvTranspose(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 4, 4)), ))
 
+def test_convolution_ranges():
+    class ConvModel(nnx.Module):
+        def __init__(self, conv_type, in_features: int, out_features: int, kernel_size: int, strides: int, dilation: int, rngs=nnx.Rngs):
+            self.conv = conv_type(
+                in_features=in_features,
+                out_features=out_features,
+                kernel_size=kernel_size,
+                strides=strides,
+                kernel_dilation=dilation,
+                rngs=rngs
+            )
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    for conv_type in [nnx.Conv, nnx.ConvTranspose]:
+        for in_features in [1, 3]:
+            for out_features in [1, 3]:
+                for kernel_size in [2, 3]:
+                    for strides in [2, 3]:
+                        for dilation in [2, 3]:
+                            model = ConvModel(
+                                conv_type=conv_type,
+                                in_features=in_features,
+                                out_features=out_features,
+                                kernel_size=kernel_size,
+                                strides=strides,
+                                dilation=dilation,
+                                rngs=nnx.Rngs(0)
+                            )
+                            run_and_compare(nnx.jit(model), (jnp.zeros((2, 8, in_features)), ))
 
 class ResidualConv(nnx.Module):
     scale_conv: nnx.Conv
