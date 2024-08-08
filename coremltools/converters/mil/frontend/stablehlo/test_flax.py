@@ -3,7 +3,7 @@ from flax import nnx
 import jax.numpy as jnp
 
 from functools import partial
-from typing import Optional
+from typing import Optional, List
 
 from coremltools.converters.mil.frontend.stablehlo.test.test_jax import run_and_compare
 
@@ -224,3 +224,41 @@ def test_flax_residual_conv_module():
     model_downscale = ResidualConv(in_channels=4, out_channels=2, rngs=nnx.Rngs(0))
     model_downscale.eval()
     run_and_compare(nnx.jit(model_downscale), (jnp.zeros((4, 4, 4)), ))
+
+class Encoder(nnx.Module):
+    cnn_layers: List[ResidualConv]
+    normalization: nnx.Module
+
+    def __init__(self, rngs: nnx.Rngs):
+        self.cnn_layers = []
+
+        num_layers = 3
+        for i in range(num_layers):
+            in_channels = (2 ** i)
+            out_channels = 2 ** (i + 1)
+
+            self.cnn_layers.append(ResidualConv(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                rngs=rngs,
+            ))
+
+        last_layer_features = 2 ** num_layers
+        self.normalization = nnx.BatchNorm(num_features=last_layer_features, rngs=rngs)
+
+    def __call__(self, x):
+        out = x
+        skip_connections = []
+        for layer in self.cnn_layers:
+            out = layer(out)
+            skip_connections.append(out)
+
+        out = self.normalization(out)
+        out = nnx.tanh(out)
+
+        return out, skip_connections
+
+def test_encoder():
+    model = Encoder(nnx.Rngs(0))
+    model.eval()
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 1)), ))

@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, ExpOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, ExpOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp
 
 import numpy as np
 
@@ -32,6 +32,7 @@ class TranscriptionContext:
                 # Ensure that the new context name is in fact unique
                 # A collision can happen if the same function is called twice
                 ctx_name = f"{name}_{counter}"
+                counter += 1
             else:
                 self._path.append(ctx_name)
                 self.seen_paths.add(self.path())
@@ -485,6 +486,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_rsqrt(self, context: TranscriptionContext, op: RsqrtOp):
         x = context[op.operand.get_name()]
         mil_res = mb.rsqrt(x=x)
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_tanh(self, context: TranscriptionContext, op: TanhOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.tanh(x=x)
         context.add_variable(op.result.get_name(), mil_res)
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):

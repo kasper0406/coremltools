@@ -5,6 +5,7 @@ from jax.experimental import export
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 import numpy as np
+from itertools import chain
 
 from coremltools.converters.mil.frontend.stablehlo.load import load
 import coremltools as ct
@@ -27,6 +28,9 @@ def generate_random_from_shape(input_spec, key=jax.random.PRNGKey):
     dtype = input_spec.dtype
     output = jax.random.uniform(key=key, shape=shape, dtype=dtype, minval=-10, maxval=10)
     return output
+
+def flatten_list(nested_list):
+    return list(chain.from_iterable(flatten_list(i) if isinstance(i, list) else [i] for i in nested_list))
 
 def run_and_compare(jax_func, input_spec):
     jax_func = jax.jit(jax_func)
@@ -53,7 +57,7 @@ def run_and_compare(jax_func, input_spec):
         expected_output = (expected_output, )
 
     cml_expected_outputs = {}
-    for output_name, output_value in zip(cml_model.output_description, expected_output):
+    for output_name, output_value in zip(cml_model.output_description, flatten_list(expected_output)):
         cml_expected_outputs[output_name] = np.asarray(output_value)
 
     compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)
