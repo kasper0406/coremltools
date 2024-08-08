@@ -111,16 +111,28 @@ def test_flax_transposed_convolution():
     model = TestTransposedConvolution(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 2)), ))
 
-def test_dilated_conv():
+def test_kernel_dilated_conv():
     class DilatedConvolution(nnx.Module):
         def __init__(self, rngs=nnx.Rngs):
-            self.conv = nnx.Conv(in_features=2, out_features=3, kernel_size=4, kernel_dilation=2, rngs=rngs)
+            self.conv = nnx.Conv(in_features=4, out_features=2, kernel_size=4, kernel_dilation=2, rngs=rngs)
 
         def __call__(self, x):
             return self.conv(x)
 
     model = DilatedConvolution(nnx.Rngs(0))
-    run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 2)), ))
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 4, 4)), ))
+
+def test_strided_conv_transpose():
+    class StridedConvTranspose(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.ConvTranspose(in_features=4, out_features=2, kernel_size=3, strides=2, rngs=rngs)
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    model = StridedConvTranspose(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 4, 4)), ))
+
 
 class ResidualConv(nnx.Module):
     scale_conv: nnx.Conv
@@ -174,9 +186,9 @@ class ResidualConv(nnx.Module):
         return out
 
 def test_flax_residual_conv_module():
-    # model_upscale = ResidualConv(in_channels=2, out_channels=4, rngs=nnx.Rngs(0))
-    # model_upscale.eval()
-    # run_and_compare(nnx.jit(model_upscale), (jnp.zeros((4, 8, 2)), ))
+    model_upscale = ResidualConv(in_channels=2, out_channels=4, rngs=nnx.Rngs(0))
+    model_upscale.eval()
+    run_and_compare(nnx.jit(model_upscale), (jnp.zeros((4, 8, 2)), ))
 
     model_downscale = ResidualConv(in_channels=4, out_channels=2, rngs=nnx.Rngs(0))
     model_downscale.eval()

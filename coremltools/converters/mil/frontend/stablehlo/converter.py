@@ -15,6 +15,7 @@ from typing import Dict, List
 import inspect
 from dataclasses import dataclass
 import re
+from functools import partial
 
 class TranscriptionContext:
     def __init__(self):
@@ -406,12 +407,27 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # We switch the convolution to a transposed convolution if we have lhs_dilation
         conv_type = mb.conv
-        if op.lhs_dilation is not None:
-            if strides is not None:
-                raise ValueError("For a conv with lhs dilation we expect the stride to be not set! Because convolution with input dilation d is equivalent to transposed convolution with stride d.")
-            # Convolution with input dilation d is equivalent to transposed convolution with stride d
-            strides = np.array(op.lhs_dilation, dtype=np.int32)
-            conv_type = mb.conv_transpose
+        if op.lhs_dilation:
+            lhs_dilations = np.array(op.lhs_dilation, dtype=np.int32)
+            if np.any(lhs_dilations > 1):
+                # This is a transpoed convolution
+                if strides is not None:
+                    raise ValueError("For a conv with lhs dilation we expect the stride to be not set! Because convolution with input dilation d is equivalent to transposed convolution with stride d.")
+                # Convolution with input dilation d is equivalent to transposed convolution with stride d
+                strides = lhs_dilations
+
+                output_shape = op.result.type.shape
+                output_shape.append(output_shape.pop(1)) # Match the format of MIL
+
+                conv_type = partial(
+                    mb.conv_transpose,
+                    output_shape=output_shape
+                )
+
+                # We need to subtract 1 from the padding to make the dimensions line up
+                pad -= 1
+                if np.any(pad < 0):
+                    raise ValueError("The case where the padding turns negative when translating to a transposed convolution is not supported.")
 
         # The MIL weights should be on form:
         #  - normal convolutions: [C_out, C_in / groups, Kernel*]
@@ -430,6 +446,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # Kernel perms moved to after the channels
             perm.append(i)
         weight = mb.transpose(x=weight, perm=perm)
+
+        # TODO(knielsen): Make this check more readable!
+        # It is executed for conv transpose
+        if conv_type != mb.conv:
+            # MIL expects the weights to be reversed along the kernel dimensions
+            kernel_dimensions = [ i + 2 for i in range(len(weight.shape) - 2) ]
+            weight = mb.reverse(x=weight, axes=kernel_dimensions)
 
         cml_conv = conv_type(
             x=x,
