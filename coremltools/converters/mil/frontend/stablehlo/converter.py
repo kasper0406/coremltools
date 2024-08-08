@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, ExpOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp
 
 import numpy as np
 
@@ -245,6 +245,26 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         operand = context[op.operand.get_name()]
         minus_one = np.array([-1], dtype=types.nptype_from_builtin(operand.dtype))
         cml_op = mb.mul(x=minus_one, y=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_sign(self, context: TranscriptionContext, op: SignOp):
+        operand = context[op.operand.get_name()]
+        cml_op = mb.sign(x=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_abs(self, context: TranscriptionContext, op: AbsOp):
+        operand = context[op.operand.get_name()]
+        cml_op = mb.abs(x=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_log1p(self, context: TranscriptionContext, op: Log1pOp):
+        operand = context[op.operand.get_name()]
+        one = np.array([1], dtype=types.nptype_from_builtin(self.__resolve_type(operand)))
+        x_plus_one = mb.add(x=one, y=operand)
+        cml_op = mb.log(x=x_plus_one)
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
@@ -492,6 +512,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_tanh(self, context: TranscriptionContext, op: TanhOp):
         x = context[op.operand.get_name()]
         mil_res = mb.tanh(x=x)
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_concatenate(self, context: TranscriptionContext, op: ConcatenateOp):
+        values = [ context[input.get_name()] for input in op.inputs ]
+        mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_variable(op.result.get_name(), mil_res)
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):

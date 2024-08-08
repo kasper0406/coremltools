@@ -229,10 +229,9 @@ class Encoder(nnx.Module):
     cnn_layers: List[ResidualConv]
     normalization: nnx.Module
 
-    def __init__(self, rngs: nnx.Rngs):
+    def __init__(self, num_layers: int, rngs: nnx.Rngs):
         self.cnn_layers = []
 
-        num_layers = 3
         for i in range(num_layers):
             in_channels = (2 ** i)
             out_channels = 2 ** (i + 1)
@@ -259,6 +258,72 @@ class Encoder(nnx.Module):
         return out, skip_connections
 
 def test_encoder():
-    model = Encoder(nnx.Rngs(0))
+    model = Encoder(num_layers=3, rngs=nnx.Rngs(0))
+    model.eval()
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 1)), ))
+
+class Decoder(nnx.Module):
+    cnn_layers: List[ResidualConv]
+    residual_norm_layers: List[nnx.Module]
+    output_polling: nnx.Conv
+
+    def __init__(self, num_layers: int, rngs: nnx.Rngs):
+        self.cnn_layers = []
+        self.residual_norm_layers = []
+
+        input_features = 2 ** num_layers
+        for i in range(num_layers):
+            # Times two to handle residual connections
+            in_channels = 2 * (input_features // (2 ** i))
+            out_channels = input_features // (2 ** (i + 1))
+
+            self.residual_norm_layers.append(nnx.BatchNorm(in_channels, rngs=rngs))
+            self.cnn_layers.append(ResidualConv(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                rngs=rngs,
+            ))
+
+        last_layer_features = input_features // (2 ** num_layers)
+        self.output_polling = nnx.Conv(
+            in_features=last_layer_features,
+            out_features=1,
+            kernel_size=3,
+            rngs=rngs,
+        )
+
+    def __call__(self, x, skip_connections):
+        skip_connections = list(reversed(skip_connections))
+
+        out = x
+        for i, (cnn_layer, residual_norm) in enumerate(zip(self.cnn_layers, self.residual_norm_layers)):
+            residual = skip_connections[i]
+            out = residual_norm(jnp.concatenate([out, residual], axis=-1))
+            out = cnn_layer(out)
+
+        out = self.output_polling(out)
+        return out
+
+class UNet(nnx.Module):
+    encoder: Encoder
+    decoder: Decoder
+
+    def __init__(self, num_layers: int, rngs: nnx.Rngs):
+        self.audio_encoding = Encoder(num_layers=num_layers, rngs=rngs)
+        self.audio_decoding = Decoder(num_layers=num_layers, rngs=rngs)
+
+    def __call__(self, x):
+        def compress_dynamic_range(samples):
+            mu = jnp.array(255.0, dtype=jnp.float16)
+            return jnp.sign(samples) * jnp.log1p(mu * jnp.abs(samples)) / jnp.log1p(mu)
+        x = compress_dynamic_range(x)
+
+        hidden, skip_connections = self.audio_encoding(x)
+        out = self.audio_decoding(hidden, skip_connections)
+
+        return out
+
+def test_unet():
+    model = UNet(num_layers=3, rngs=nnx.Rngs(0))
     model.eval()
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 1)), ))
