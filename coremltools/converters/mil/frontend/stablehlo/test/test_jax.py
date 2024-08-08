@@ -19,7 +19,15 @@ def test_addition():
     run_and_compare(plus, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
 
 def jax_export(jax_func, input_spec):
-    input_shapes = [jax.ShapeDtypeStruct(input.shape, input.dtype) for input in input_spec]
+    def compute_input_shapes(input_specs):
+        shapes = []
+        for input_spec in input_specs:
+            if isinstance(input_spec, (list, tuple)):
+                shapes.append(compute_input_shapes(input_spec))
+            else:
+                shapes.append(jax.ShapeDtypeStruct(input_spec.shape, input_spec.dtype))
+        return shapes
+    input_shapes = compute_input_shapes(input_spec)
     jax_exported = export.export(jax.jit(jax_func))(*input_shapes)
     return jax_exported
 
@@ -29,8 +37,37 @@ def generate_random_from_shape(input_spec, key=jax.random.PRNGKey):
     output = jax.random.uniform(key=key, shape=shape, dtype=dtype, minval=-10, maxval=10)
     return output
 
-def flatten_list(nested_list):
-    return list(chain.from_iterable(flatten_list(i) if isinstance(i, list) else [i] for i in nested_list))
+def flatten(nested_list):
+    def visit(lst):
+        flat = []
+        for element in lst:
+            if isinstance(element, (list, tuple)):
+                flat += visit(element)
+            else:
+                flat.append(element)
+        return flat
+    return visit(nested_list)
+
+def __nest_flat_jax_input_to_input_spec(input_spec, flat_input):
+    idx = 0
+    def visit(lst):
+        nonlocal idx
+        result = []
+        for element in lst:
+            if isinstance(element, (list, tuple)):
+                result.append(visit(element))
+            else:
+                if idx >= len(flat_input):
+                    raise ValueError(f"flat_input had too many inputs to fit input_spec. Input spec: {input_spec}, Flat input: {flat_input}")
+                result.append(flat_input[idx])
+                idx += 1
+        return result
+
+    structured_input = visit(input_spec)
+    if idx != len(flat_input):
+        raise ValueError("flat_input had too few inputs to fill input_spec. Input spec: {input_spec}, Flat input: {flat_input}")
+
+    return structured_input
 
 def run_and_compare(jax_func, input_spec):
     jax_func = jax.jit(jax_func)
@@ -41,6 +78,7 @@ def run_and_compare(jax_func, input_spec):
 
     cml_model = ct.convert(hlo_module)
 
+    # Generate random inputs that matches cml_model input spec
     cml_input_key_values = {}
     jax_input_values = []
     key = jax.random.PRNGKey(0)
@@ -50,14 +88,17 @@ def run_and_compare(jax_func, input_spec):
         cml_input_key_values[input_name] = input_value
         jax_input_values.append(input_value)
 
+    # Transfor the input to match the Jax model, and call it
+    jax_input_values = __nest_flat_jax_input_to_input_spec(input_spec, jax_input_values)
     expected_output = jax_func(*jax_input_values)
     
     # TODO(knielsen): Is there a nicer way of doing this?
     if not isinstance(expected_output, (list, tuple)):
         expected_output = (expected_output, )
 
+    # Prepare the output for comparison
     cml_expected_outputs = {}
-    for output_name, output_value in zip(cml_model.output_description, flatten_list(expected_output)):
+    for output_name, output_value in zip(cml_model.output_description, flatten(expected_output)):
         cml_expected_outputs[output_name] = np.asarray(output_value)
 
     compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)

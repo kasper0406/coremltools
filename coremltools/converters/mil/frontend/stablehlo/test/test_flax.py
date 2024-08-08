@@ -7,6 +7,7 @@ from functools import partial
 from coremltools.converters.mil.frontend.stablehlo.test.test_jax import run_and_compare
 
 from flax_blocks import ResidualConv, Encoder, UNet
+from flax_xlstm import sLSTMCell, xLSTM
 
 def test_flax_nnx_linear():
     class TestLinear(nnx.Module):
@@ -184,3 +185,25 @@ def test_unet():
     model = UNet(num_layers=3, rngs=nnx.Rngs(0))
     model.eval()
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 1)), ))
+
+def test_slstm_cell():
+    batch_size = 2
+    hidden_size = 4
+    rngs = nnx.Rngs(0)
+
+    model = sLSTMCell(num_cells=hidden_size, rngs=rngs)
+    model.eval()
+    x = jnp.zeros((batch_size, hidden_size))
+    carry = sLSTMCell.init_carry(batch_size, hidden_size, rngs=rngs)
+    run_and_compare(nnx.jit(model), (carry, x))
+
+def test_xlstm():
+    batch_size = 4
+    hidden_size = 6
+    rngs = nnx.Rngs(0)
+
+    model = xLSTM(hidden_size=hidden_size, num_heads=2, num_layers=3, rngs=rngs)
+    carry = model.init_carry(batch_size, rngs=rngs)
+    x = jnp.zeros((batch_size, hidden_size))
+    model.eval()
+    run_and_compare(nnx.jit(model), (carry, x))

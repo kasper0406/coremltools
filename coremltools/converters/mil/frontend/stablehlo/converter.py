@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp
 
 import numpy as np
 
@@ -15,7 +15,8 @@ from typing import Dict, List
 import inspect
 from dataclasses import dataclass
 import re
-from functools import partial
+from functools import partial, reduce
+import operator
 
 class TranscriptionContext:
     def __init__(self):
@@ -274,6 +275,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
+    def op_transpose(self, context: TranscriptionContext, op: TransposeOp):
+        operand = context[op.operand.get_name()]
+        perm = np.array(op.permutation, dtype=np.int32)
+        cml_op = mb.transpose(x=operand, perm=perm)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
     def op_constant(self, context: TranscriptionContext, op: ConstantOp):
         constant = np.array(op.value)
         context.add_variable(op.result.get_name(), constant)
@@ -309,6 +317,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # CoreML seems to auto-broadcast along the lines of numpy. Therefore this
         # explicit broadcasting op is not necessary.
         x = context[op.operand.get_name()]
+
+        # We handle one special case where the broadcast functions as a reshape
+        op_elements = reduce(operator.mul, op.result.type.shape, 1)
+        x_elements = reduce(operator.mul, x.shape, 1)
+        if op_elements == x_elements:
+            # We know that the only possibility is for data to be added, so this is likely a reshape
+            x = mb.reshape(x=x, shape=op.result.type.shape)
+
         context.add_variable(op.result.get_name(), x)
 
     @register_stablehlo_op
