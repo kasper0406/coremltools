@@ -25,6 +25,18 @@ def uniform(minval: RealNumeric = 0,
     return jax.random.uniform(key, shape, dtype, minval=minval, maxval=maxval)
   return init
 
+def hacky_scan_wrapper(f, x, y):
+    """
+    Unfortunately is nnx is not too fond of nnx.scan when exporting
+    """
+    return jax.lax.scan(f, x, y)
+    def wrapped_f(x, y):
+        with jax.disable_jit(False):
+            return f(x, y)
+
+    with jax.disable_jit():
+        return jax.lax.scan(wrapped_f, x, y, unroll=True)
+
 class sLSTMCell(nnx.Module):
     cell_input_proj: nnx.Linear
     cell_state_proj: nnx.Linear
@@ -153,10 +165,12 @@ class sLSTMBlock(nnx.Module):
     def __call__(self, carry, x):
         out = self.input_norm(x)
 
-        @partial(nnx.vmap, in_axes=(0, 0, None))
-        def call_slstm(slstm, carry, x):
+        slstm_defs, slstm_states = nnx.split(self.heads)
+        @partial(jax.vmap, in_axes=(0, 0, None))
+        def call_slstm(slstm_state, carry, x):
+            slstm = nnx.merge(slstm_defs, slstm_state)
             return slstm(carry, x)
-        carry, out = call_slstm(self.heads, carry, out)
+        carry, out = call_slstm(slstm_states, carry, out)
 
         out = self.output_norm(out)
         out = einops.rearrange(out, "heads batch hidden -> batch (heads hidden)")
@@ -328,10 +342,12 @@ class mLSTMBlock(nnx.Module):
         triggers = nnx.silu(self.up_proj_2(out))
         mlstm_input = self.up_proj_1(out)
 
-        @partial(nnx.vmap, in_axes=(0, 0, None))
-        def call_mlstm(mlstm, carry, x):
+        mlstm_def, mlstm_layer_states = nnx.split(self.heads)
+        @partial(jax.vmap, in_axes=(0, 0, None))
+        def call_mlstm(mlstm_state, carry, x):
+            mlstm = nnx.merge(mlstm_def, mlstm_state)
             return mlstm(carry, x)
-        carry, mlstm_out = call_mlstm(self.heads, carry, mlstm_input)
+        carry, mlstm_out = call_mlstm(mlstm_layer_states, carry, mlstm_input)
         mlstm_out = self.output_norm(mlstm_out)
         mlstm_out = einops.rearrange(mlstm_out, "heads batch hidden -> batch (heads hidden)")
         mlstm_out = self.head_polling(mlstm_out)
@@ -388,12 +404,12 @@ class xLSTMModule(nnx.Module):
             return y, carry
 
         out = x
-        out, mlstm_carry = jax.lax.scan(
+        out, mlstm_carry = hacky_scan_wrapper(
             partial(forward, defs=mlstm_def),
             out,
             (mlstm_states, mlstm_carry))
 
-        out, slstm_carry = jax.lax.scan(
+        out, slstm_carry = hacky_scan_wrapper(
             partial(forward, defs=slstm_def),
             out,
             (slstm_states, slstm_carry))
@@ -429,7 +445,7 @@ class xLSTM(nnx.Module):
             carry, y = xlstm(carry, x)
             return y, carry
 
-        out, carry = jax.lax.scan(forward, x, (layers_state, carry))
+        out, carry = hacky_scan_wrapper(forward, x, (layers_state, carry))
         return carry, out
 
     def init_carry(self, batch_size: int, rngs: nnx.Rngs):

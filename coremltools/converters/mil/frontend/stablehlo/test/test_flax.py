@@ -7,7 +7,7 @@ from functools import partial
 from coremltools.converters.mil.frontend.stablehlo.test.test_jax import run_and_compare
 
 from flax_blocks import ResidualConv, Encoder, UNet
-from flax_xlstm import sLSTMCell, mLSTMCell, xLSTM
+from flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, xLSTM
 
 def test_flax_nnx_linear():
     class TestLinear(nnx.Module):
@@ -197,6 +197,18 @@ def test_slstm_cell():
     carry = sLSTMCell.init_carry(batch_size, hidden_size, rngs=rngs)
     run_and_compare(nnx.jit(model), (carry, x))
 
+def test_slstm_block():
+    batch_size = 2
+    hidden_size = 4
+    num_heads=3
+    rngs = nnx.Rngs(0)
+
+    model = sLSTMBlock(hidden_size=hidden_size, num_heads=num_heads, rngs=rngs)
+    model.eval()
+    x = jnp.zeros((batch_size, hidden_size))
+    carry = sLSTMBlock.init_carry(batch_size, hidden_size, num_heads, rngs=rngs)
+    run_and_compare(nnx.jit(model), (carry, x))
+
 def test_mlstm_cell():
     batch_size = 2
     hidden_size = 4
@@ -213,7 +225,7 @@ def test_xlstm():
     hidden_size = 6
     rngs = nnx.Rngs(0)
 
-    model = xLSTM(hidden_size=hidden_size, num_heads=2, num_layers=3, rngs=rngs)
+    model = xLSTM(hidden_size=hidden_size, num_heads=3, num_layers=3, rngs=rngs)
     carry = model.init_carry(batch_size, rngs=rngs)
     x = jnp.zeros((batch_size, hidden_size))
     model.eval()

@@ -7,11 +7,11 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp
 
 import numpy as np
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 import inspect
 from dataclasses import dataclass
 import re
@@ -117,7 +117,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     func_indx: Dict[str, FuncOp]
 
-    def __init__(self, opset_version: bool = None):
+    def __init__(self, opset_version: Optional[int] = None):
         self.opset_version = _target(opset_version) if opset_version is not None else None
         self.prog = mil.Program()
         self.func_index = {}
@@ -294,6 +294,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_dot_general(self, context: TranscriptionContext, op: DotGeneralOp):
+        # TODO(knielsen): Consider a nicer way of implementing this...
+        #                 Maybe following the steps from https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
         lhs_rank = len(op.lhs.type.shape)
         rhs_rank = len(op.rhs.type.shape)
         dims = self.__hacky_parse_attribute(op.dot_dimension_numbers)
@@ -311,11 +313,21 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
-        if len(contract_lhs) == 1 and contract_lhs[0] == lhs_rank - 1 and len(contract_rhs) == 1 and contract_rhs[0] == rhs_rank - 2 and len(batching_lhs) == 0 and len(batching_rhs) == 0:
-            # This special case corresponds to CoreML matmul
-            matmul_res = mb.matmul(x=lhs, y=rhs)
-            context.add_variable(op.result.get_name(), matmul_res)
-            return
+        if contract_lhs == [lhs_rank - 1] and contract_rhs == [rhs_rank - 2] and batching_lhs == [] and batching_rhs == []:
+            # If we cross the batch broadcast boundry we are in trouble
+            if (lhs_rank > 2 and rhs_rank > 2) or (lhs_rank <= 2 and rhs_rank <= 2):
+                # This special case corresponds to CoreML matmul
+                matmul_res = mb.matmul(x=lhs, y=rhs)
+                context.add_variable(op.result.get_name(), matmul_res)
+                return
+            
+            if lhs_rank == 2 and rhs_rank == 3:
+                # We can do the matmul as normal and then transpose the result
+                matmul_res = mb.matmul(x=lhs, y=rhs)
+                matmul_res = mb.transpose(x=matmul_res, perm=(1, 0, 2))
+                context.add_variable(op.result.get_name(), matmul_res)
+                return
+
         if batching_lhs == [0] and batching_rhs == [0]:
             if len(contract_lhs) == 0 and len(contract_rhs) == 0:
                 # This is the full outer product apart from the batch dim
@@ -344,6 +356,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
                     context.add_variable(op.result.get_name(), res)
                     return
+                
+                if lhs_rank == 3 and rhs_rank == 3:
+                    # This is the outer product apart from the batch dim.
+                    # We express this with mat-mul and reshapes, as MIL's einsum implementation is very limited
+                    lhs_reshaped = mb.reshape(x=lhs, shape=lhs.shape + (1,))
+                    rhs_reshaped = mb.reshape(x=rhs, shape=list(rhs.shape)[:-1] + [1] + list(rhs.shape)[-1:])
+                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
+                if lhs_rank == 2 and rhs_rank > 2 and lhs.shape[1] == rhs.shape[1]:
+                    # Reshape lhs with empty dimensions, and then it boils down to a scalar multiplication
+                    lhs_reshaped = mb.reshape(x=lhs, shape=[lhs.shape[0], lhs.shape[1]] + [1] * (rhs_rank - lhs_rank))
+                    res = mb.mul(x=lhs_reshaped, y=rhs)
+                    context.add_variable(op.result.get_name(), res)
+                    return
 
             if contract_lhs == [1] and contract_rhs == [1]:
                 if lhs_rank == 2 and rhs_rank == 2:
@@ -364,6 +392,31 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     res = mb.matmul(x=lhs, y=rhs_reshaped)
                     # Ensure that our dimensions are contracted
                     res = mb.reshape(x=res, shape=(lhs.shape[0], lhs.shape[1]))
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
+                if lhs_rank == 3 and rhs_rank == 3:
+                    # This is a normal matrix-matrix multiplication up to the batch dim
+                    res = mb.matmul(x=lhs, y=rhs)
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
+            if contract_lhs == [2] and contract_rhs == [2]:
+                if lhs_rank == 3 and rhs_rank == 3:
+                    # Inner product of the last dim
+                    lhs_reshaped = mb.reshape(x=lhs, shape=list(lhs.shape)[:-1] + [1] + list(lhs.shape)[-1:])
+                    rhs_reshaped = mb.reshape(x=rhs, shape=rhs.shape + (1,))
+                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
+                    # Ensure that our dimensions are contracted
+                    res = mb.reshape(x=res, shape=(lhs.shape[0], lhs.shape[1]))
+                    context.add_variable(op.result.get_name(), res)
+                    return
+
+            if contract_lhs == [3] and contract_rhs == [2]:
+                if lhs_rank == 4 and rhs_rank == 3:
+                    rhs_reshaped = mb.reshape(x=rhs, shape=rhs.shape + (1,))
+                    res = mb.matmul(x=lhs, y=rhs_reshaped)
+                    res = mb.reshape(x=res, shape=rhs.shape)
                     context.add_variable(op.result.get_name(), res)
                     return
 
@@ -389,6 +442,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if op_elements == x_elements:
             # We know that the only possibility is for data to be added, so this is likely a reshape
             x = mb.reshape(x=x, shape=op.result.type.shape)
+
+        # Another special case. If we are broadcasting a constant in all directions, just change the shape
+        if len(op.broadcast_dimensions) == 0 and len(x.shape) == 0:
+            dtype = types.nptype_from_builtin(self.__resolve_type(x))
+            x = mb.mul(x=x, y=np.ones(op.result.type.shape, dtype=dtype))
 
         context.add_variable(op.result.get_name(), x)
 
@@ -461,6 +519,23 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         cml_op = mb.slice_by_size(x=x, begin=begin, size=sizes)
         context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_dynamic_update_slice(self, context: TranscriptionContext, op: DynamicUpdateSliceOp):
+        x = context[op.operand.get_name()]
+        updates = context[op.update.get_name()]
+
+        start_indices = [ context[i.get_name()] for i in op.start_indices ]
+        start_indices = mb.concat(values=start_indices, axis=0)
+        end_indices = mb.add(x=start_indices, y=op.update.type.shape)
+
+        update_res = mb.slice_update(
+            x=x,
+            update=updates,
+            begin=start_indices,
+            end=end_indices,
+        )
+        context.add_variable(op.result.get_name(), update_res)
 
     @register_stablehlo_op
     def op_convolution(self, context: TranscriptionContext, op: ConvolutionOp):

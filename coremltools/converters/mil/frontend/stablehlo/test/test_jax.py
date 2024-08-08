@@ -76,7 +76,7 @@ def run_and_compare(jax_func, input_spec):
     hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
     # print(f"HLO module: {hlo_module}")
 
-    cml_model = ct.convert(hlo_module)
+    cml_model = ct.convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
 
     # Generate random inputs that matches cml_model input spec
     cml_input_key_values = {}
