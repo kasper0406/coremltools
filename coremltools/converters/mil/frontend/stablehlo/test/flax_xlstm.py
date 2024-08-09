@@ -6,7 +6,7 @@ from jax._src import core
 from jax._src import dtypes
 
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Optional, List
 import einops
 
 KeyArray = Any
@@ -25,18 +25,6 @@ def uniform(minval: RealNumeric = 0,
     return jax.random.uniform(key, shape, dtype, minval=minval, maxval=maxval)
   return init
 
-def hacky_scan_wrapper(f, x, y):
-    """
-    Unfortunately is nnx is not too fond of nnx.scan when exporting
-    """
-    return jax.lax.scan(f, x, y)
-    def wrapped_f(x, y):
-        with jax.disable_jit(False):
-            return f(x, y)
-
-    with jax.disable_jit():
-        return jax.lax.scan(wrapped_f, x, y, unroll=True)
-
 class sLSTMCell(nnx.Module):
     cell_input_proj: nnx.Linear
     cell_state_proj: nnx.Linear
@@ -53,6 +41,7 @@ class sLSTMCell(nnx.Module):
     if_conv: nnx.Conv | None = None
 
     def __init__(self, num_cells: int, rngs: nnx.Rngs, input_size: Optional[int] = None, apply_if_conv: bool = True):
+        self.num_cells = num_cells
         construct_x_proj = partial(nnx.Linear,
             in_features=input_size if input_size else num_cells,
             out_features=num_cells,
@@ -94,6 +83,12 @@ class sLSTMCell(nnx.Module):
     def __call__(self, carry, x):
         cell_state, hidden_state, normalizer_state, stabilizer_state = carry
 
+        # HACK: See init_carry for an explanation
+        cell_state = einops.rearrange(cell_state, "(b h) -> b h", h=self.num_cells)
+        hidden_state = einops.rearrange(hidden_state, "(b h) -> b h", h=self.num_cells)
+        normalizer_state = einops.rearrange(normalizer_state, "(b h) -> b h", h=self.num_cells)
+        stabilizer_state = einops.rearrange(stabilizer_state, "(b h) -> b h", h=self.num_cells)
+
         # print(f"Hidden state shape: {hidden_state.shape}")
         out = nnx.sigmoid(self.output_gate_proj(x) + self.output_state_proj(hidden_state))
 
@@ -116,19 +111,34 @@ class sLSTMCell(nnx.Module):
         n = f * normalizer_state + i # Normalizer state
         h = out * c / n # Hidden state
 
-        return (c, h, n, m), h
+        c = einops.rearrange(c, "b h -> (b h)")
+        h_not_compacted = h
+        h = einops.rearrange(h, "b h -> (b h)")
+        n = einops.rearrange(n, "b h -> (b h)")
+        m = einops.rearrange(m, "b h -> (b h)")
+
+        return (c, h, n, m), h_not_compacted
 
     @classmethod
     def init_carry(cls, batch_size: int, num_cells: int, rngs: nnx.Rngs):
         initializer = partial(nnx.initializers.zeros, shape=(batch_size, num_cells), dtype=jnp.float16)
         c = initializer(key=rngs())
+        # HACK: CoreML does not supprot tensors of rank > 5, so we squeeze the c carry to make it fit
+        c = einops.rearrange(c, "b h -> (b h)")
+
         h = initializer(key=rngs())
+        h = einops.rearrange(h, "b h -> (b h)")
+
         n = initializer(key=rngs())
+        n = einops.rearrange(n, "b h -> (b h)")
+
         m = initializer(key=rngs())
+        m = einops.rearrange(m, "b h -> (b h)")
+
         return c, h, n, m
 
 class sLSTMBlock(nnx.Module):
-    heads: sLSTMCell
+    heads: List[sLSTMCell]
     input_norm: nnx.BatchNorm
     output_norm: nnx.BatchNorm
 
@@ -137,10 +147,9 @@ class sLSTMBlock(nnx.Module):
     down_proj: nnx.Linear
 
     def __init__(self, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=num_heads)
-        def create_heads(rngs: nnx.Rngs):
-            return sLSTMCell(hidden_size, rngs)
-        self.heads = create_heads(rngs)
+        self.heads = []
+        for _i in range(num_heads):
+            self.heads.append(sLSTMCell(hidden_size, rngs))
 
         self.input_norm = nnx.BatchNorm(hidden_size, rngs=rngs)
         self.output_norm = nnx.BatchNorm(hidden_size, rngs=rngs) # reduction_axes=..., feature_axes=...)
@@ -165,12 +174,14 @@ class sLSTMBlock(nnx.Module):
     def __call__(self, carry, x):
         out = self.input_norm(x)
 
-        slstm_defs, slstm_states = nnx.split(self.heads)
-        @partial(jax.vmap, in_axes=(0, 0, None))
-        def call_slstm(slstm_state, carry, x):
-            slstm = nnx.merge(slstm_defs, slstm_state)
-            return slstm(carry, x)
-        carry, out = call_slstm(slstm_states, carry, out)
+        head_carries = []
+        heads_out = []
+        for head, c in zip(self.heads, zip(*carry)):
+            c, head_out = head(c, out)
+            head_carries.append(c)
+            heads_out.append(head_out)
+        carry = [ jnp.stack(c, axis=0) for c in zip(*head_carries) ]
+        out = jnp.stack(heads_out, axis=0)
 
         out = self.output_norm(out)
         out = einops.rearrange(out, "heads batch hidden -> batch (heads hidden)")
@@ -249,6 +260,7 @@ class mLSTMCell(nnx.Module):
         cell_state, normalizer_state, stabilizer_state = carry
         # HACK: See init_carry for an explanation
         cell_state = einops.rearrange(cell_state, "(b h1 h2) -> b h1 h2", h1=self.hidden_size, h2=self.hidden_size)
+        normalizer_state = einops.rearrange(normalizer_state, "(b h) -> b h", h=self.hidden_size)
         
         out = nnx.sigmoid(self.output_proj(x)) # + self.output_state_proj(hidden_state))
 
@@ -282,6 +294,7 @@ class mLSTMCell(nnx.Module):
 
         # HACK: See init_carry for an explanation
         c = einops.rearrange(c, "b h1 h2 -> (b h1 h2)")
+        n = einops.rearrange(n, "b h -> (b h)")
         return (c, n, m), h
 
     @classmethod
@@ -291,12 +304,14 @@ class mLSTMCell(nnx.Module):
         c = einops.rearrange(c, "b h1 h2 -> (b h1 h2)")
 
         n = nnx.initializers.zeros(shape=(batch_size, hidden_size), dtype=jnp.float16, key=rngs())
+        n = einops.rearrange(n, "b h -> (b h)")
+
         m = nnx.initializers.zeros(shape=(batch_size,), dtype=jnp.float16, key=rngs())
 
         return c, n, m
 
 class mLSTMBlock(nnx.Module):
-    heads: mLSTMCell
+    heads: List[mLSTMCell]
     input_norm: nnx.BatchNorm
     output_norm: nnx.BatchNorm
 
@@ -306,10 +321,9 @@ class mLSTMBlock(nnx.Module):
     head_polling: nnx.Linear
 
     def __init__(self, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=num_heads)
-        def create_heads(rngs: nnx.Rngs):
-            return mLSTMCell(2 * hidden_size, rngs)
-        self.heads = create_heads(rngs)
+        self.heads = []
+        for _ in range(num_heads):
+            self.heads.append(mLSTMCell(2 * hidden_size, rngs))
 
         self.input_norm = nnx.BatchNorm(hidden_size, rngs=rngs)
         self.output_norm = nnx.BatchNorm(2 * hidden_size, rngs=rngs) # reduction_axes=..., feature_axes=...)
@@ -342,12 +356,17 @@ class mLSTMBlock(nnx.Module):
         triggers = nnx.silu(self.up_proj_2(out))
         mlstm_input = self.up_proj_1(out)
 
-        mlstm_def, mlstm_layer_states = nnx.split(self.heads)
-        @partial(jax.vmap, in_axes=(0, 0, None))
-        def call_mlstm(mlstm_state, carry, x):
-            mlstm = nnx.merge(mlstm_def, mlstm_state)
-            return mlstm(carry, x)
-        carry, mlstm_out = call_mlstm(mlstm_layer_states, carry, mlstm_input)
+        # Call the heads
+        head_carries = []
+        heads_out = []
+        for head, c in zip(self.heads, zip(*carry)):
+            c, head_out = head(c, mlstm_input)
+            head_carries.append(c)
+            heads_out.append(head_out)
+        carry = [ jnp.stack(c, axis=0) for c in zip(*head_carries) ]
+        mlstm_out = jnp.stack(heads_out, axis=0)
+
+
         mlstm_out = self.output_norm(mlstm_out)
         mlstm_out = einops.rearrange(mlstm_out, "heads batch hidden -> batch (heads hidden)")
         mlstm_out = self.head_polling(mlstm_out)
@@ -372,8 +391,8 @@ class xLSTMModule(nnx.Module):
     hidden_size: int
     num_heads: int
 
-    mlstms: mLSTMBlock
-    slstms: sLSTMBlock
+    mlstms: List[mLSTMBlock]
+    slstms: List[sLSTMBlock]
 
     def __init__(self, hidden_size: int, num_heads: int, num_mlstm: int, num_slstm: int, rngs: nnx.Rngs):
         self.num_mlstm = num_mlstm
@@ -381,38 +400,32 @@ class xLSTMModule(nnx.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
 
-        @partial(nnx.vmap, axis_size=num_mlstm)
-        def create_mlstms(rngs: nnx.Rngs):
-            return mLSTMBlock(hidden_size, num_heads, rngs=rngs)
-        self.mlstms = create_mlstms(rngs)
+        self.mlstms = []
+        for _ in range(num_mlstm):
+            self.mlstms.append(mLSTMBlock(hidden_size, num_heads, rngs=rngs))
 
-        @partial(nnx.vmap, axis_size=num_slstm)
-        def create_slstms(rngs: nnx.Rngs):
-            return sLSTMBlock(hidden_size, num_heads, rngs=rngs)
-        self.slstms = create_slstms(rngs)
+        self.slstms = []
+        for _ in range(num_slstm):
+            self.slstms.append(sLSTMBlock(hidden_size, num_heads, rngs=rngs))
 
     def __call__(self, carry, x):
         mlstm_carry, slstm_carry = carry
 
-        mlstm_def, mlstm_states = nnx.split(self.mlstms)
-        slstm_def, slstm_states = nnx.split(self.slstms)
-
-        def forward(x, spec, defs):
-            state, carry = spec
-            xlstm = nnx.merge(defs, state)
-            carry, y = xlstm(carry, x)
-            return y, carry
-
         out = x
-        out, mlstm_carry = hacky_scan_wrapper(
-            partial(forward, defs=mlstm_def),
-            out,
-            (mlstm_states, mlstm_carry))
 
-        out, slstm_carry = hacky_scan_wrapper(
-            partial(forward, defs=slstm_def),
-            out,
-            (slstm_states, slstm_carry))
+        # Call the mLSTMs
+        mlstm_carries = []
+        for mlstm, c in zip(self.mlstms, zip(*mlstm_carry)):
+            c, out = mlstm(c, out)
+            mlstm_carries.append(c)
+        mlstm_carry = [ jnp.stack(c, axis=0) for c in zip(*mlstm_carries) ]
+
+        # Call the sLSTMs
+        slstm_carries = []
+        for slstm, c in zip(self.slstms, zip(*slstm_carry)):
+            c, out = slstm(c, out)
+            slstm_carries.append(c)
+        slstm_carry = [ jnp.stack(c, axis=0) for c in zip(*slstm_carries) ]
 
         return (mlstm_carry, slstm_carry), out
     
@@ -428,28 +441,24 @@ class xLSTMModule(nnx.Module):
         return (create_mlstm_carry(rngs), create_slstm_carry(rngs))
 
 class xLSTM(nnx.Module):
-    layers: xLSTMModule
+    layers: List[xLSTMModule]
 
     def __init__(self, hidden_size: int, num_heads: int, num_layers: int, rngs: nnx.Rngs, mlstm_per_layer: int = 1, slstm_per_layer: int = 1):
-        @partial(nnx.vmap, axis_size=num_layers)
-        def create_layers(rngs: nnx.Rngs):
-            return xLSTMModule(hidden_size, num_heads, mlstm_per_layer, slstm_per_layer, rngs)
-        self.layers = create_layers(rngs)
+        self.layers = []
+        for _ in range(num_layers):
+            self.layers.append(xLSTMModule(hidden_size, num_heads, mlstm_per_layer, slstm_per_layer, rngs))
 
     def __call__(self, carry, x):
-        layer_def, layers_state = nnx.split(self.layers)
+        out = x
+        carries = []
+        for layer, c in zip(self.layers, carry):
+            c, out = layer(c, out)
+            carries.append(c)
 
-        def forward(x, spec):
-            xlstm_state, carry = spec
-            xlstm = nnx.merge(layer_def, xlstm_state)
-            carry, y = xlstm(carry, x)
-            return y, carry
-
-        out, carry = hacky_scan_wrapper(forward, x, (layers_state, carry))
-        return carry, out
+        return carries, out
 
     def init_carry(self, batch_size: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap)
-        def create_carry(xlstm, rngs):
-            return xlstm.init_carry(batch_size, rngs)
-        return create_carry(self.layers, rngs)
+        carries = []
+        for layer in self.layers:
+            carries.append(layer.init_carry(batch_size, rngs))
+        return carries

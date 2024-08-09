@@ -168,7 +168,9 @@ _FRONTEND_TF2_PASSES: List[Text] = [
 ]
 
 _FRONTEND_STABLEHLO_PASSES: List[Text] = [
-    
+    "common::dead_code_elimination",
+    "common::loop_invariant_elimination",
+    "common::dead_code_elimination",
 ]
 
 _BACKEND_MIL_PASSES: List[Text] = [

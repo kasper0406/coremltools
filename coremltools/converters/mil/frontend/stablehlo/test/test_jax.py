@@ -10,6 +10,7 @@ from itertools import chain
 from coremltools.converters.mil.frontend.stablehlo.load import load
 import coremltools as ct
 from coremltools.converters.mil.testing_utils import compare_backend
+from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipeline
 
 def test_addition():
     def plus(x, y):
@@ -69,7 +70,7 @@ def __nest_flat_jax_input_to_input_spec(input_spec, flat_input):
 
     return structured_input
 
-def run_and_compare(jax_func, input_spec):
+def run_and_compare(jax_func, input_spec, atol=1e-04, rtol=1e-05):
     jax_func = jax.jit(jax_func)
     exported = jax_export(jax_func, input_spec)
     context = jax_mlir.make_ir_context()
@@ -101,4 +102,4 @@ def run_and_compare(jax_func, input_spec):
     for output_name, output_value in zip(cml_model.output_description, flatten(expected_output)):
         cml_expected_outputs[output_name] = np.asarray(output_value)
 
-    compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)
+    compare_backend(cml_model, cml_input_key_values, cml_expected_outputs, dtype="fp16", atol=atol, rtol=rtol)

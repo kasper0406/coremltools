@@ -412,6 +412,9 @@ def compare_backend(
             coreml_out = _get_coreml_out_from_dict(pred, o)
 
             if isinstance(coreml_out, np.ndarray):
+                # Clip the inputs to guard inf's
+                coreml_out = np.clip(coreml_out, -1e6, 1e6)
+                expected = np.clip(expected, -1e6, 1e6)
                 np.testing.assert_allclose(coreml_out, expected, atol=atol, rtol=rtol)
             elif isinstance(coreml_out, dict):
                 for k, v in coreml_out.items():

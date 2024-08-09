@@ -7,7 +7,7 @@ from coremltools.converters.mil.input_types import TensorType
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp
+from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
 
 import numpy as np
 
@@ -518,6 +518,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         sizes = np.array(op.slice_sizes, dtype=np.int32)
 
         cml_op = mb.slice_by_size(x=x, begin=begin, size=sizes)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_slice(self, context: TranscriptionContext, op: SliceOp):
+        x = context[op.operand.get_name()]
+
+        begin = np.array(op.start_indices, dtype=np.int32)
+        end = np.array(op.limit_indices, dtype=np.int32)
+        stride = np.array(op.strides, dtype=np.int32)
+
+        cml_op = mb.slice_by_index(
+            x=x,
+            begin=begin,
+            end=end,
+            stride=stride,
+        )
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op

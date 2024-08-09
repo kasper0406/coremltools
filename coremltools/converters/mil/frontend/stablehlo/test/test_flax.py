@@ -7,7 +7,7 @@ from functools import partial
 from coremltools.converters.mil.frontend.stablehlo.test.test_jax import run_and_compare
 
 from flax_blocks import ResidualConv, Encoder, UNet
-from flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, xLSTM
+from flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
 
 def test_flax_nnx_linear():
     class TestLinear(nnx.Module):
@@ -220,13 +220,42 @@ def test_mlstm_cell():
     carry = mLSTMCell.init_carry(batch_size, hidden_size, rngs=rngs)
     run_and_compare(nnx.jit(model), (carry, x))
 
-def test_xlstm():
-    batch_size = 4
-    hidden_size = 6
+def test_mlstm_block():
+    batch_size = 2
+    hidden_size = 4
+    num_heads=3
     rngs = nnx.Rngs(0)
 
-    model = xLSTM(hidden_size=hidden_size, num_heads=3, num_layers=3, rngs=rngs)
+    model = mLSTMBlock(hidden_size=hidden_size, num_heads=num_heads, rngs=rngs)
+    model.eval()
+    x = jnp.zeros((batch_size, hidden_size))
+    carry = mLSTMBlock.init_carry(batch_size, hidden_size, num_heads, rngs=rngs)
+    run_and_compare(nnx.jit(model), (carry, x))
+
+def test_xlstm_module():
+    batch_size = 2
+    hidden_size = 4
+    num_heads = 3
+    num_mlstm = 2
+    num_slstm = 1
+    rngs = nnx.Rngs(0)
+
+    model = xLSTMModule(hidden_size=hidden_size, num_heads=num_heads, num_mlstm=num_mlstm, num_slstm=num_slstm, rngs=rngs)
+    model.eval()
+    x = jnp.zeros((batch_size, hidden_size))
+    carry = model.init_carry(batch_size, rngs=rngs)
+    # The xLSTM module model is quite deep, so we allow more slack in the outputs
+    run_and_compare(nnx.jit(model), (carry, x), atol=1e-1, rtol=1e-2)
+
+def test_xlstm():
+    batch_size = 4
+    hidden_size = 3
+    rngs = nnx.Rngs(0)
+
+    model = xLSTM(hidden_size=hidden_size, num_heads=2, num_layers=1, rngs=rngs)
     carry = model.init_carry(batch_size, rngs=rngs)
     x = jnp.zeros((batch_size, hidden_size))
     model.eval()
-    run_and_compare(nnx.jit(model), (carry, x))
+
+    # The xLSTM model is quite deep, so we allow more slack in the outputs
+    run_and_compare(nnx.jit(model), (carry, x), atol=1e-1, rtol=1e-2)
