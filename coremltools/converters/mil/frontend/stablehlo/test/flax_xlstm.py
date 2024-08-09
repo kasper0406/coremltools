@@ -147,9 +147,10 @@ class sLSTMBlock(nnx.Module):
     down_proj: nnx.Linear
 
     def __init__(self, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        self.heads = []
-        for _i in range(num_heads):
-            self.heads.append(sLSTMCell(hidden_size, rngs))
+        @partial(nnx.vmap, axis_size=num_heads)
+        def create_heads(rngs: nnx.Rngs):
+            return sLSTMCell(hidden_size, rngs)
+        self.heads = create_heads(rngs)
 
         self.input_norm = nnx.BatchNorm(hidden_size, rngs=rngs)
         self.output_norm = nnx.BatchNorm(hidden_size, rngs=rngs) # reduction_axes=..., feature_axes=...)
@@ -174,14 +175,11 @@ class sLSTMBlock(nnx.Module):
     def __call__(self, carry, x):
         out = self.input_norm(x)
 
-        head_carries = []
-        heads_out = []
-        for head, c in zip(self.heads, zip(*carry)):
-            c, head_out = head(c, out)
-            head_carries.append(c)
-            heads_out.append(head_out)
-        carry = [ jnp.stack(c, axis=0) for c in zip(*head_carries) ]
-        out = jnp.stack(heads_out, axis=0)
+        head_def, head_states = nnx.split(self.heads)
+        def eval_heads(head_state, carry, x):
+            head = nnx.merge(head_def, head_state)
+            return head(carry, x)
+        carry, out = jax.vmap(eval_heads, in_axes=(0, 0, None), out_axes=(0, 0))(head_states, carry, out)
 
         out = self.output_norm(out)
         out = einops.rearrange(out, "heads batch hidden -> batch (heads hidden)")
@@ -321,9 +319,10 @@ class mLSTMBlock(nnx.Module):
     head_polling: nnx.Linear
 
     def __init__(self, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        self.heads = []
-        for _ in range(num_heads):
-            self.heads.append(mLSTMCell(2 * hidden_size, rngs))
+        @partial(nnx.vmap, axis_size=num_heads)
+        def create_heads(rngs: nnx.Rngs):
+            return mLSTMCell(2 * hidden_size, rngs)
+        self.heads = create_heads(rngs)
 
         self.input_norm = nnx.BatchNorm(hidden_size, rngs=rngs)
         self.output_norm = nnx.BatchNorm(2 * hidden_size, rngs=rngs) # reduction_axes=..., feature_axes=...)
@@ -356,16 +355,11 @@ class mLSTMBlock(nnx.Module):
         triggers = nnx.silu(self.up_proj_2(out))
         mlstm_input = self.up_proj_1(out)
 
-        # Call the heads
-        head_carries = []
-        heads_out = []
-        for head, c in zip(self.heads, zip(*carry)):
-            c, head_out = head(c, mlstm_input)
-            head_carries.append(c)
-            heads_out.append(head_out)
-        carry = [ jnp.stack(c, axis=0) for c in zip(*head_carries) ]
-        mlstm_out = jnp.stack(heads_out, axis=0)
-
+        head_def, head_states = nnx.split(self.heads)
+        def eval_heads(head_state, carry, x):
+            head = nnx.merge(head_def, head_state)
+            return head(carry, x)
+        carry, mlstm_out = jax.vmap(eval_heads, in_axes=(0, 0, None), out_axes=(0, 0))(head_states, carry, mlstm_input)
 
         mlstm_out = self.output_norm(mlstm_out)
         mlstm_out = einops.rearrange(mlstm_out, "heads batch hidden -> batch (heads hidden)")

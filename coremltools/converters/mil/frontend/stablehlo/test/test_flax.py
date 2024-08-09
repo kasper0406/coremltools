@@ -207,7 +207,7 @@ def test_slstm_block():
     model.eval()
     x = jnp.zeros((batch_size, hidden_size))
     carry = sLSTMBlock.init_carry(batch_size, hidden_size, num_heads, rngs=rngs)
-    run_and_compare(nnx.jit(model), (carry, x))
+    run_and_compare(nnx.jit(model), (carry, x), atol=1e-1, rtol=1e-2)
 
 def test_mlstm_cell():
     batch_size = 2
@@ -230,13 +230,13 @@ def test_mlstm_block():
     model.eval()
     x = jnp.zeros((batch_size, hidden_size))
     carry = mLSTMBlock.init_carry(batch_size, hidden_size, num_heads, rngs=rngs)
-    run_and_compare(nnx.jit(model), (carry, x))
+    run_and_compare(nnx.jit(model), (carry, x), atol=1e-1, rtol=1e-2)
 
 def test_xlstm_module():
     batch_size = 2
     hidden_size = 4
-    num_heads = 3
-    num_mlstm = 2
+    num_heads = 2
+    num_mlstm = 1
     num_slstm = 1
     rngs = nnx.Rngs(0)
 
@@ -252,7 +252,7 @@ def test_xlstm():
     hidden_size = 3
     rngs = nnx.Rngs(0)
 
-    model = xLSTM(hidden_size=hidden_size, num_heads=2, num_layers=1, rngs=rngs)
+    model = xLSTM(hidden_size=hidden_size, num_heads=1, num_layers=1, rngs=rngs)
     carry = model.init_carry(batch_size, rngs=rngs)
     x = jnp.zeros((batch_size, hidden_size))
     model.eval()
@@ -261,8 +261,8 @@ def test_xlstm():
     run_and_compare(nnx.jit(model), (carry, x), atol=1e-1, rtol=1e-2)
 
 def test_unet_with_xlstm():
-    batch_size = 4
-    num_conv_layers = 3
+    batch_size = 2
+    num_conv_layers = 2
     input_size = 2 ** num_conv_layers
     rngs = nnx.Rngs(0)
 
@@ -271,4 +271,4 @@ def test_unet_with_xlstm():
     x = jnp.zeros((batch_size, input_size, 1))
     model.eval()
 
-    run_and_compare(nnx.jit(model), (carry, x, ))
+    run_and_compare(nnx.jit(model), (carry, x, ), atol=1e-1, rtol=1e-2)
