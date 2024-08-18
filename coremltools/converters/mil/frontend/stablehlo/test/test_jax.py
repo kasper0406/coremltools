@@ -19,6 +19,12 @@ def test_addition():
     run_and_compare(plus, (jnp.float32(1), jnp.float32(1)))
     run_and_compare(plus, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
 
+def test_tensor_multiplication():
+    def matrix_multiplication(a, b):
+        return jnp.einsum("ij,jk -> ik", a, b)
+    run_and_compare(matrix_multiplication, (jnp.zeros((3, 4)), jnp.zeros((4, 5))))
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []

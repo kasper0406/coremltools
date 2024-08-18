@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import re
 from functools import partial, reduce
 import operator
+import itertools
+import builtins
 
 class TranscriptionContext:
     def __init__(self):
@@ -294,8 +296,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_dot_general(self, context: TranscriptionContext, op: DotGeneralOp):
-        # TODO(knielsen): Consider a nicer way of implementing this...
-        #                 Maybe following the steps from https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
+        # This roughly follows the steps from https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
+        # but uses that we have a matrix multiplication primitive, instead of just a dot-product primitive.
         lhs_rank = len(op.lhs.type.shape)
         rhs_rank = len(op.rhs.type.shape)
         dims = self.__hacky_parse_attribute(op.dot_dimension_numbers)
@@ -305,122 +307,196 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 return []
             return [ int(d.strip()) for d in dims[key].strip("[]").split(",") ]
 
-        contract_lhs = parse_dim("lhs_contracting_dimensions")
-        contract_rhs = parse_dim("rhs_contracting_dimensions")
-        batching_lhs = parse_dim("lhs_batching_dimensions")
-        batching_rhs = parse_dim("rhs_batching_dimensions")
+        def multiply(lst: List):
+            if len(lst) == 0:
+                return 1
+            return reduce(lambda a, b: int(a) * int(b), lst)
+
+        lhs_contracting_dim = parse_dim("lhs_contracting_dimensions")
+        rhs_contracting_dim = parse_dim("rhs_contracting_dimensions")
+        lhs_batching_dim = parse_dim("lhs_batching_dimensions")
+        rhs_batching_dim = parse_dim("rhs_batching_dimensions")
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
-        if contract_lhs == [lhs_rank - 1] and contract_rhs == [rhs_rank - 2] and batching_lhs == [] and batching_rhs == []:
-            # If we cross the batch broadcast boundry we are in trouble
-            if (lhs_rank > 2 and rhs_rank > 2) or (lhs_rank <= 2 and rhs_rank <= 2):
-                # This special case corresponds to CoreML matmul
-                matmul_res = mb.matmul(x=lhs, y=rhs)
-                context.add_variable(op.result.get_name(), matmul_res)
-                return
+        def last_column_dot(lhs, rhs):
+            # TODO: We need to check for broadcasting dims!!!
+            switch_last_two = list(range(len(lhs.shape)))
+            switch_last_two.append(switch_last_two.pop(-1))
+            lhs = mb.transpose(x=lhs, perm=switch_last_two)
+            return mb.matmul(x=lhs, y=rhs)
+        
+        lhs_result_dim = [ dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim  ]
+        rhs_result_dim = [ dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim  ]
+
+        # For both the lhs and rhs, put the dimensions being contracted last
+        transposed_lhs = mb.transpose(x=lhs, perm=lhs_batching_dim + lhs_result_dim + lhs_contracting_dim)
+        transposed_rhs = mb.transpose(x=rhs, perm=rhs_batching_dim + rhs_result_dim + rhs_contracting_dim)
+
+        # Calculate the result by looping over the contracting dims in order
+        result_shape = [ lhs.shape[dim] for dim in lhs_batching_dim ] + [ lhs.shape[dim] for dim in lhs_result_dim ] + [ rhs.shape[dim] for dim in rhs_result_dim ]
+        result = np.zeros(result_shape)
+
+        def index_by_slices(tensor, slice_spec):
+            start_indices = []
+            end_indices = []
+            strides = []
+
+            def value_or_default(val, default):
+                if val:
+                    return val
+                return default
+
+            tensor_rank = len(tensor.shape)
+            ellipsis_encountered = False
+            dim_counter = 0
+            for i, spec in enumerate(slice_spec):
+                match spec:
+                    case builtins.slice:
+                        start_indices.append(value_or_default(spec.start(), 0))
+                        end_indices.append(value_or_default(spec.stop(), tensor.shape[dim_counter]))
+                        strides.append(value_or_default(spec.step(), 1))
+                        dim_counter += 1
+                    case builtins.Ellipsis:
+                        if ellipsis_encountered:
+                            raise ValueError("Only supports one ellipsis when indexing")
+                        ellipsis_encountered = True
+
+                        dims_before = i
+                        dims_after = len(slice_spec) - i - 1
+                        num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
+
+                        ellipsis_starts = [ 0 ] * num_ellipsis_dims
+                        ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
+                        ellipsis_strides = [ 1 ] * num_ellipsis_dims
+
+                        start_indices += ellipsis_starts
+                        end_indices += ellipsis_ends
+                        strides += ellipsis_strides
+
+                        dim_counter += num_ellipsis_dims
+                    case _:
+                        # Assume it is an integer index
+                        idx = int(spec)
+                        start_indices.append(idx)
+                        end_indices.append(idx + 1)
+                        strides.append(1)
+                        dim_counter += 1
             
-            if lhs_rank == 2 and rhs_rank == 3:
-                # We can do the matmul as normal and then transpose the result
-                matmul_res = mb.matmul(x=lhs, y=rhs)
-                matmul_res = mb.transpose(x=matmul_res, perm=(1, 0, 2))
-                context.add_variable(op.result.get_name(), matmul_res)
-                return
+            if len(start_indices) != tensor_rank:
+                raise ValueError("Slice does not line up!")
 
-        if batching_lhs == [0] and batching_rhs == [0]:
-            if len(contract_lhs) == 0 and len(contract_rhs) == 0:
-                # This is the full outer product apart from the batch dim
-                if lhs_rank == 1:
-                    # This is a simple scalar multiplication with a re-shape
-                    new_shape = [lhs.shape[0]] + [1] * (rhs_rank - 1)
-                    reshaped = mb.reshape(x=lhs, shape=new_shape)
-                    res = mb.mul(x=reshaped, y=rhs)
-                    context.add_variable(op.result.get_name(), res)
-                    return
-                if rhs_rank == 1:
-                    # This is a simple scalar multiplication with a re-shape
-                    new_shape = [rhs.shape[0]] + [1] * (lhs_rank - 1)
-                    reshaped = mb.reshape(x=rhs, shape=new_shape)
-                    res = mb.mul(x=lhs, y=reshaped)
-                    context.add_variable(op.result.get_name(), res)
-                    return
-                
-                # Unfortunately MIL is quite limited in its einsum implementation
-                # We handle some simple cases that will get the job done for now
-                if lhs_rank == 2 and rhs_rank == 2:
-                    # This is the outer product apart from the batch dim.
-                    # We express this with mat-mul and reshapes, as MIL's einsum implementation is very limited
-                    lhs_reshaped = mb.reshape(x=lhs, shape=(lhs.shape[0], lhs.shape[1], 1))
-                    rhs_reshaped = mb.reshape(x=rhs, shape=(rhs.shape[0], 1, rhs.shape[1]))
-                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
-                    context.add_variable(op.result.get_name(), res)
-                    return
-                
-                if lhs_rank == 3 and rhs_rank == 3:
-                    # This is the outer product apart from the batch dim.
-                    # We express this with mat-mul and reshapes, as MIL's einsum implementation is very limited
-                    lhs_reshaped = mb.reshape(x=lhs, shape=lhs.shape + (1,))
-                    rhs_reshaped = mb.reshape(x=rhs, shape=list(rhs.shape)[:-1] + [1] + list(rhs.shape)[-1:])
-                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
-                    context.add_variable(op.result.get_name(), res)
-                    return
+            return mb.slice_by_index(x=tensor, begin=start_indices, end=end_indices, stride=strides)
 
-                if lhs_rank == 2 and rhs_rank > 2 and lhs.shape[1] == rhs.shape[1]:
-                    # Reshape lhs with empty dimensions, and then it boils down to a scalar multiplication
-                    lhs_reshaped = mb.reshape(x=lhs, shape=[lhs.shape[0], lhs.shape[1]] + [1] * (rhs_rank - lhs_rank))
-                    res = mb.mul(x=lhs_reshaped, y=rhs)
-                    context.add_variable(op.result.get_name(), res)
-                    return
+        def update_tensor_by_slice(tensor, slice_spec, value):
+            start_indices = []
+            end_indices = []
+            strides = []
 
-            if contract_lhs == [1] and contract_rhs == [1]:
-                if lhs_rank == 2 and rhs_rank == 2:
-                    # In this case this is the full inner product apart from the batch dim
-                    # Again we can utilize some reshapes
-                    lhs_reshaped = mb.reshape(x=lhs, shape=(lhs.shape[0], 1, lhs.shape[1]))
-                    rhs_reshaped = mb.reshape(x=rhs, shape=(rhs.shape[0], rhs.shape[1], 1))
-                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
-                    # Ensure that our dimensions are contracted
-                    res = mb.reshape(x=res, shape=(lhs.shape[0],))
-                    context.add_variable(op.result.get_name(), res)
-                    return
+            def value_or_default(val, default):
+                if val:
+                    return val
+                return default
 
-            if contract_lhs == [2] and contract_rhs == [1]:
-                if lhs_rank == 3 and rhs_rank == 2:
-                    # This is a matrix to vector multiplication up to the batch dim
-                    rhs_reshaped = mb.reshape(x=rhs, shape=(rhs.shape[0], rhs.shape[1], 1))
-                    res = mb.matmul(x=lhs, y=rhs_reshaped)
-                    # Ensure that our dimensions are contracted
-                    res = mb.reshape(x=res, shape=(lhs.shape[0], lhs.shape[1]))
-                    context.add_variable(op.result.get_name(), res)
-                    return
+            tensor_rank = len(tensor.shape)
+            ellipsis_encountered = False
+            dim_counter = 0
+            for i, spec in enumerate(slice_spec):
+                match spec:
+                    case builtins.slice:
+                        start_indices.append(value_or_default(spec.start(), 0))
+                        end_indices.append(value_or_default(spec.stop(), tensor.shape[dim_counter]))
+                        strides.append(value_or_default(spec.step(), 1))
+                        dim_counter += 1
+                    case builtins.Ellipsis:
+                        if ellipsis_encountered:
+                            raise ValueError("Only supports one ellipsis when indexing")
+                        ellipsis_encountered = True
 
-                if lhs_rank == 3 and rhs_rank == 3:
-                    # This is a normal matrix-matrix multiplication up to the batch dim
-                    res = mb.matmul(x=lhs, y=rhs)
-                    context.add_variable(op.result.get_name(), res)
-                    return
+                        dims_before = i
+                        dims_after = len(slice_spec) - i - 1
+                        num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
 
-            if contract_lhs == [2] and contract_rhs == [2]:
-                if lhs_rank == 3 and rhs_rank == 3:
-                    # Inner product of the last dim
-                    lhs_reshaped = mb.reshape(x=lhs, shape=list(lhs.shape)[:-1] + [1] + list(lhs.shape)[-1:])
-                    rhs_reshaped = mb.reshape(x=rhs, shape=rhs.shape + (1,))
-                    res = mb.matmul(x=lhs_reshaped, y=rhs_reshaped)
-                    # Ensure that our dimensions are contracted
-                    res = mb.reshape(x=res, shape=(lhs.shape[0], lhs.shape[1]))
-                    context.add_variable(op.result.get_name(), res)
-                    return
+                        ellipsis_starts = [ 0 ] * num_ellipsis_dims
+                        ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
+                        ellipsis_strides = [ 1 ] * num_ellipsis_dims
 
-            if contract_lhs == [3] and contract_rhs == [2]:
-                if lhs_rank == 4 and rhs_rank == 3:
-                    rhs_reshaped = mb.reshape(x=rhs, shape=rhs.shape + (1,))
-                    res = mb.matmul(x=lhs, y=rhs_reshaped)
-                    res = mb.reshape(x=res, shape=rhs.shape)
-                    context.add_variable(op.result.get_name(), res)
-                    return
+                        start_indices += ellipsis_starts
+                        end_indices += ellipsis_ends
+                        strides += ellipsis_strides
 
-        raise ValueError(f"The specified DotGeneral operation is not supported: {op}")
+                        dim_counter += num_ellipsis_dims
+                    case _:
+                        # Assume it is an integer index
+                        idx = int(spec)
+                        start_indices.append(idx)
+                        end_indices.append(idx + 1)
+                        strides.append(1)
+                        dim_counter += 1
+            
+            if len(start_indices) != tensor_rank:
+                raise ValueError("Slice does not line up!")
+
+            return mb.slice_update(x=tensor, update=value, begin=start_indices, end=end_indices, stride=strides)
+
+
+        # We can utilize that we have a full matrix multiply primitive available, compared to having only
+        # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
+        # the lhs and rhs tensors
+        lhs_result_indices = itertools.product(*[ range(lhs.shape[dim]) for dim in lhs_result_dim[:-1] ])
+        rhs_result_indices = itertools.product(*[ range(rhs.shape[dim]) for dim in rhs_result_dim[:-1] ])
+        for lhs_idx, rhs_idx in itertools.product(lhs_result_indices, rhs_result_indices):
+            # We may have to add an extra slice for the skipped dimension
+            result_idx = ()
+            result_idx += lhs_idx
+            if len(lhs_result_dim) > 0:
+                result_idx += (slice(None), )
+            result_idx += rhs_idx
+            if len(rhs_result_dim) > 0:
+                result_idx += (slice(None), )
+            # print(f"Calculating result for index {result_idx}, lhs = {lhs_idx}, rhs = {rhs_idx}")
+
+            contracted_element_count = multiply([ lhs.shape[dim] for dim in lhs_contracting_dim ])
+            # print(f"contracted_element_count = {contracted_element_count}")
+            batch_selector = tuple([ slice(None) for _i in range(len(lhs_batching_dim)) ])
+            batch_shape = tuple([ lhs.shape[dim] for dim in lhs_batching_dim ])
+
+            # Reshape the lhs and rhs to have all the contracting dimensions in the end.
+            # We will always make them have the shape `(batch_shape, last_dim_shape, contraction_count)``
+            # where we may have to set `last_dim_shape` to 1, if the dimension does not exist.
+            lhs_for_result_idx = index_by_slices(transposed_lhs, batch_selector + lhs_idx + ( ..., ))
+            if len(lhs_result_dim) > 0:
+                lhs_reshape_shape = batch_shape + (lhs.shape[lhs_result_dim[-1]],) + (contracted_element_count, )
+            else:
+                lhs_reshape_shape = batch_shape + (1, contracted_element_count)
+            contracted_lhs = mb.reshape(x=lhs_for_result_idx, shape=lhs_reshape_shape)
+
+            rhs_for_result_idx = index_by_slices(transposed_rhs, batch_selector + rhs_idx + ( ..., ))
+            if len(rhs_result_dim) > 0:
+                rhs_reshape_shape = batch_shape + (rhs.shape[rhs_result_dim[-1]],) + (contracted_element_count, )
+            else:
+                rhs_reshape_shape = batch_shape + (1, contracted_element_count)
+            contracted_rhs = mb.reshape(x=rhs_for_result_idx, shape=rhs_reshape_shape)
+
+            # print(f"contracted_lhs shape: {contracted_lhs.shape}")
+            # print(f"contracted_rhs shape: {contracted_rhs.shape}")
+
+            idx_result = last_column_dot(contracted_lhs, contracted_rhs)
+
+            # If we added a fake dimension, we will make sure to squeeze it away
+            if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:
+                idx_result = mb.squeeze(x=idx_result, axes=(-1, -2))
+            elif len(lhs_result_dim) == 0:
+                idx_result = mb.squeeze(x=idx_result, axes=(-2))
+            elif len(rhs_result_dim) == 0:
+                idx_result = mb.squeeze(x=idx_result, axes=(-1))
+
+            # TODO: Consider making this work on iOS<18 by using concatenation
+            update_tensor_by_slice(result, batch_selector + result_idx, idx_result)
+
+        return result
+
 
     @register_stablehlo_op
     def op_reshape(self, context: TranscriptionContext, op: ReshapeOp):
