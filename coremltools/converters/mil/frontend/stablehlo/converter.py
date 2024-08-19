@@ -4,6 +4,7 @@ from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
 from coremltools.converters.mil.input_types import TensorType
+from coremltools.converters.mil.frontend.stablehlo.utils import index_by_slices, update_tensor_by_slice
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -303,11 +304,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs_rank = len(op.rhs.type.shape)
         dot_dim_numbers = hlo.DotDimensionNumbers(op.dot_dimension_numbers)
 
-        def multiply(lst: List):
-            if len(lst) == 0:
-                return 1
-            return reduce(lambda a, b: int(a) * int(b), lst)
-
         lhs_contracting_dim = dot_dim_numbers.lhs_contracting_dimensions
         rhs_contracting_dim = dot_dim_numbers.rhs_contracting_dimensions
         lhs_batching_dim = dot_dim_numbers.lhs_batching_dimensions
@@ -315,6 +311,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
+
+        def multiply(lst: List):
+            if len(lst) == 0:
+                return 1
+            return reduce(lambda a, b: int(a) * int(b), lst)
 
         def last_column_dot(lhs, rhs):
             # TODO: Figure out if we need to special case broadcasting dims
@@ -333,113 +334,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # Special case for scalar result
             result_shape = [1]
         result = mb.fill(shape=result_shape)
-
-        def index_by_slices(tensor, slice_spec):
-            start_indices = []
-            end_indices = []
-            strides = []
-
-            def value_or_default(val, default):
-                if val:
-                    return val
-                return default
-
-            tensor_rank = len(tensor.shape)
-            ellipsis_encountered = False
-            dim_counter = 0
-            for i, spec in enumerate(slice_spec):
-                if isinstance(spec, type(slice(None))):
-                    start_indices.append(value_or_default(spec.start, 0))
-                    end_indices.append(value_or_default(spec.stop, tensor.shape[dim_counter]))
-                    strides.append(value_or_default(spec.step, 1))
-                    dim_counter += 1
-                elif isinstance(spec, type(Ellipsis)):
-                    if ellipsis_encountered:
-                        raise ValueError("Only supports one ellipsis when indexing")
-                    ellipsis_encountered = True
-
-                    dims_before = i
-                    dims_after = len(slice_spec) - i - 1
-                    num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
-
-                    ellipsis_starts = [ 0 ] * num_ellipsis_dims
-                    ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
-                    ellipsis_strides = [ 1 ] * num_ellipsis_dims
-
-                    start_indices += ellipsis_starts
-                    end_indices += ellipsis_ends
-                    strides += ellipsis_strides
-
-                    dim_counter += num_ellipsis_dims
-                else:
-                    # Assume it is an integer index
-                    idx = int(spec)
-                    start_indices.append(idx)
-                    end_indices.append(idx + 1)
-                    strides.append(1)
-                    dim_counter += 1
-            
-            if len(start_indices) != tensor_rank:
-                raise ValueError("Slice does not line up!")
-
-            return mb.slice_by_index(x=tensor, begin=start_indices, end=end_indices, stride=strides)
-
-        def update_tensor_by_slice(tensor, slice_spec, value):
-            start_indices = []
-            end_indices = []
-            strides = []
-
-            def value_or_default(val, default):
-                if val:
-                    return val
-                return default
-
-            if len(slice_spec) == 0:
-                # Special case for scalar
-                slice_spec = [ slice(None) ]
-
-            tensor_rank = len(tensor.shape)
-            ellipsis_encountered = False
-            dim_counter = 0
-            for i, spec in enumerate(slice_spec):
-                if isinstance(spec, type(slice(None))):
-                    start_indices.append(value_or_default(spec.start, 0))
-                    end_indices.append(value_or_default(spec.stop, tensor.shape[dim_counter]))
-                    strides.append(value_or_default(spec.step, 1))
-                    dim_counter += 1
-                elif isinstance(spec, type(Ellipsis)):
-                    if ellipsis_encountered:
-                        raise ValueError("Only supports one ellipsis when indexing")
-                    ellipsis_encountered = True
-
-                    dims_before = i
-                    dims_after = len(slice_spec) - i - 1
-                    num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
-
-                    ellipsis_starts = [ 0 ] * num_ellipsis_dims
-                    ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
-                    ellipsis_strides = [ 1 ] * num_ellipsis_dims
-
-                    start_indices += ellipsis_starts
-                    end_indices += ellipsis_ends
-                    strides += ellipsis_strides
-
-                    dim_counter += num_ellipsis_dims
-                else:
-                    # Assume it is an integer index
-                    idx = int(spec)
-                    start_indices.append(idx)
-                    end_indices.append(idx + 1)
-                    strides.append(1)
-                    dim_counter += 1
-            
-            if len(start_indices) != tensor_rank:
-                raise ValueError("Slice does not line up!")
-
-            reshaped_value = [ (end - start) // stride for start, end, stride in zip(start_indices, end_indices, strides) ]
-            value = mb.reshape(x=value, shape=reshaped_value)
-            return mb.slice_update(x=tensor, update=value, begin=start_indices, end=end_indices, stride=strides)
-
 
         # We can utilize that we have a full matrix multiply primitive available, compared to having only
         # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
@@ -806,10 +700,3 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if isinstance(element_type, ir.F32Type):
             return types.fp32
         raise ValueError(f"Unsupported type {element_type}")
-
-    def __tensor_type(self, name: str, type: ir.RankedTensorType) -> TensorType:
-        shape = type.shape
-        if shape == []:
-            shape = [1]
-
-        return TensorType(name=name, shape=shape, dtype=self.__get_dtype(type.element_type))
