@@ -20,9 +20,40 @@ def test_addition():
     run_and_compare(plus, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
 
 def test_tensor_multiplication():
-    def matrix_multiplication(a, b):
-        return jnp.einsum("ij,jk -> ik", a, b)
+    def scalar_product(lhs, rhs):
+        return jnp.einsum("a,a", lhs, rhs)
+    def scalar_with_vector(lhs, rhs):
+        return jnp.einsum("a,b->ab", lhs, rhs)
+    def scalar_with_matrix(lhs, rhs):
+        return jnp.einsum("a,bc->abc", lhs, rhs)
+    def vector_with_matrix(lhs, rhs):
+        return jnp.einsum("a,ab->b", lhs, rhs)
+    def matrix_multiplication(lhs, rhs):
+        return jnp.einsum("ij,jk -> ik", lhs, rhs)
+    def outer_product_with_single_batch_dim(lhs, rhs):
+        return jnp.einsum("abc,ajk->abcjk", lhs, rhs)
+    def single_contraction_single_batch(lhs, rhs):
+        return jnp.einsum("abcd,ackl->abdkl", lhs, rhs)
+    def two_contractions_single_batch(lhs, rhs):
+        return jnp.einsum("abcd,ackd->abk", lhs, rhs)
+    def three_contractions_single_batch(lhs, rhs):
+        return jnp.einsum("abcd,acbd->a", lhs, rhs)
+    def contract_all(lhs, rhs):
+        return jnp.einsum("abcd,acbd", lhs, rhs)
+    def full_tensor_product(lhs, rhs):
+        return jnp.einsum("ab,ihj->abihj", lhs, rhs)
+
+    run_and_compare(scalar_product, (jnp.zeros((1)), jnp.zeros((1))))
+    run_and_compare(scalar_with_vector, (jnp.zeros((1)), jnp.zeros((5))))
+    run_and_compare(scalar_with_matrix, (jnp.zeros((1)), jnp.zeros((5, 3))))
+    run_and_compare(vector_with_matrix, (jnp.zeros((5)), jnp.zeros((5, 3))))
     run_and_compare(matrix_multiplication, (jnp.zeros((3, 4)), jnp.zeros((4, 5))))
+    run_and_compare(outer_product_with_single_batch_dim, (jnp.zeros((2, 3, 4)), jnp.zeros((2, 4, 5))))
+    run_and_compare(single_contraction_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 2, 5))))
+    run_and_compare(two_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 2, 5))))
+    run_and_compare(three_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
+    run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
+    run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
 
 
 def jax_export(jax_func, input_spec):

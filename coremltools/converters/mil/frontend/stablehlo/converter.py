@@ -8,6 +8,7 @@ from coremltools.converters.mil.input_types import TensorType
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
+from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
 
@@ -300,33 +301,25 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # but uses that we have a matrix multiplication primitive, instead of just a dot-product primitive.
         lhs_rank = len(op.lhs.type.shape)
         rhs_rank = len(op.rhs.type.shape)
-        dims = self.__hacky_parse_attribute(op.dot_dimension_numbers)
-
-        def parse_dim(key: str):
-            if key not in dims:
-                return []
-            return [ int(d.strip()) for d in dims[key].strip("[]").split(",") ]
+        dot_dim_numbers = hlo.DotDimensionNumbers(op.dot_dimension_numbers)
 
         def multiply(lst: List):
             if len(lst) == 0:
                 return 1
             return reduce(lambda a, b: int(a) * int(b), lst)
 
-        lhs_contracting_dim = parse_dim("lhs_contracting_dimensions")
-        rhs_contracting_dim = parse_dim("rhs_contracting_dimensions")
-        lhs_batching_dim = parse_dim("lhs_batching_dimensions")
-        rhs_batching_dim = parse_dim("rhs_batching_dimensions")
+        lhs_contracting_dim = dot_dim_numbers.lhs_contracting_dimensions
+        rhs_contracting_dim = dot_dim_numbers.rhs_contracting_dimensions
+        lhs_batching_dim = dot_dim_numbers.lhs_batching_dimensions
+        rhs_batching_dim = dot_dim_numbers.rhs_batching_dimensions
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
         def last_column_dot(lhs, rhs):
-            # TODO: We need to check for broadcasting dims!!!
-            switch_last_two = list(range(len(lhs.shape)))
-            switch_last_two.append(switch_last_two.pop(-1))
-            lhs = mb.transpose(x=lhs, perm=switch_last_two)
-            return mb.matmul(x=lhs, y=rhs)
-        
+            # TODO: Figure out if we need to special case broadcasting dims
+            return mb.matmul(x=lhs, y=rhs, transpose_y=True)
+
         lhs_result_dim = [ dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim  ]
         rhs_result_dim = [ dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim  ]
 
@@ -336,7 +329,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Calculate the result by looping over the contracting dims in order
         result_shape = [ lhs.shape[dim] for dim in lhs_batching_dim ] + [ lhs.shape[dim] for dim in lhs_result_dim ] + [ rhs.shape[dim] for dim in rhs_result_dim ]
-        result = np.zeros(result_shape)
+        if len(result_shape) == 0:
+            # Special case for scalar result
+            result_shape = [1]
+        result = mb.fill(shape=result_shape)
 
         def index_by_slices(tensor, slice_spec):
             start_indices = []
@@ -352,37 +348,36 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             ellipsis_encountered = False
             dim_counter = 0
             for i, spec in enumerate(slice_spec):
-                match spec:
-                    case builtins.slice:
-                        start_indices.append(value_or_default(spec.start(), 0))
-                        end_indices.append(value_or_default(spec.stop(), tensor.shape[dim_counter]))
-                        strides.append(value_or_default(spec.step(), 1))
-                        dim_counter += 1
-                    case builtins.Ellipsis:
-                        if ellipsis_encountered:
-                            raise ValueError("Only supports one ellipsis when indexing")
-                        ellipsis_encountered = True
+                if isinstance(spec, type(slice(None))):
+                    start_indices.append(value_or_default(spec.start, 0))
+                    end_indices.append(value_or_default(spec.stop, tensor.shape[dim_counter]))
+                    strides.append(value_or_default(spec.step, 1))
+                    dim_counter += 1
+                elif isinstance(spec, type(Ellipsis)):
+                    if ellipsis_encountered:
+                        raise ValueError("Only supports one ellipsis when indexing")
+                    ellipsis_encountered = True
 
-                        dims_before = i
-                        dims_after = len(slice_spec) - i - 1
-                        num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
+                    dims_before = i
+                    dims_after = len(slice_spec) - i - 1
+                    num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
 
-                        ellipsis_starts = [ 0 ] * num_ellipsis_dims
-                        ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
-                        ellipsis_strides = [ 1 ] * num_ellipsis_dims
+                    ellipsis_starts = [ 0 ] * num_ellipsis_dims
+                    ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
+                    ellipsis_strides = [ 1 ] * num_ellipsis_dims
 
-                        start_indices += ellipsis_starts
-                        end_indices += ellipsis_ends
-                        strides += ellipsis_strides
+                    start_indices += ellipsis_starts
+                    end_indices += ellipsis_ends
+                    strides += ellipsis_strides
 
-                        dim_counter += num_ellipsis_dims
-                    case _:
-                        # Assume it is an integer index
-                        idx = int(spec)
-                        start_indices.append(idx)
-                        end_indices.append(idx + 1)
-                        strides.append(1)
-                        dim_counter += 1
+                    dim_counter += num_ellipsis_dims
+                else:
+                    # Assume it is an integer index
+                    idx = int(spec)
+                    start_indices.append(idx)
+                    end_indices.append(idx + 1)
+                    strides.append(1)
+                    dim_counter += 1
             
             if len(start_indices) != tensor_rank:
                 raise ValueError("Slice does not line up!")
@@ -399,45 +394,50 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     return val
                 return default
 
+            if len(slice_spec) == 0:
+                # Special case for scalar
+                slice_spec = [ slice(None) ]
+
             tensor_rank = len(tensor.shape)
             ellipsis_encountered = False
             dim_counter = 0
             for i, spec in enumerate(slice_spec):
-                match spec:
-                    case builtins.slice:
-                        start_indices.append(value_or_default(spec.start(), 0))
-                        end_indices.append(value_or_default(spec.stop(), tensor.shape[dim_counter]))
-                        strides.append(value_or_default(spec.step(), 1))
-                        dim_counter += 1
-                    case builtins.Ellipsis:
-                        if ellipsis_encountered:
-                            raise ValueError("Only supports one ellipsis when indexing")
-                        ellipsis_encountered = True
+                if isinstance(spec, type(slice(None))):
+                    start_indices.append(value_or_default(spec.start, 0))
+                    end_indices.append(value_or_default(spec.stop, tensor.shape[dim_counter]))
+                    strides.append(value_or_default(spec.step, 1))
+                    dim_counter += 1
+                elif isinstance(spec, type(Ellipsis)):
+                    if ellipsis_encountered:
+                        raise ValueError("Only supports one ellipsis when indexing")
+                    ellipsis_encountered = True
 
-                        dims_before = i
-                        dims_after = len(slice_spec) - i - 1
-                        num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
+                    dims_before = i
+                    dims_after = len(slice_spec) - i - 1
+                    num_ellipsis_dims = tensor_rank - (dims_before + dims_after)
 
-                        ellipsis_starts = [ 0 ] * num_ellipsis_dims
-                        ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
-                        ellipsis_strides = [ 1 ] * num_ellipsis_dims
+                    ellipsis_starts = [ 0 ] * num_ellipsis_dims
+                    ellipsis_ends = [ tensor.shape[dim] for dim in range(i, i + num_ellipsis_dims) ]
+                    ellipsis_strides = [ 1 ] * num_ellipsis_dims
 
-                        start_indices += ellipsis_starts
-                        end_indices += ellipsis_ends
-                        strides += ellipsis_strides
+                    start_indices += ellipsis_starts
+                    end_indices += ellipsis_ends
+                    strides += ellipsis_strides
 
-                        dim_counter += num_ellipsis_dims
-                    case _:
-                        # Assume it is an integer index
-                        idx = int(spec)
-                        start_indices.append(idx)
-                        end_indices.append(idx + 1)
-                        strides.append(1)
-                        dim_counter += 1
+                    dim_counter += num_ellipsis_dims
+                else:
+                    # Assume it is an integer index
+                    idx = int(spec)
+                    start_indices.append(idx)
+                    end_indices.append(idx + 1)
+                    strides.append(1)
+                    dim_counter += 1
             
             if len(start_indices) != tensor_rank:
                 raise ValueError("Slice does not line up!")
 
+            reshaped_value = [ (end - start) // stride for start, end, stride in zip(start_indices, end_indices, strides) ]
+            value = mb.reshape(x=value, shape=reshaped_value)
             return mb.slice_update(x=tensor, update=value, begin=start_indices, end=end_indices, stride=strides)
 
 
@@ -488,14 +488,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:
                 idx_result = mb.squeeze(x=idx_result, axes=(-1, -2))
             elif len(lhs_result_dim) == 0:
-                idx_result = mb.squeeze(x=idx_result, axes=(-2))
+                idx_result = mb.squeeze(x=idx_result, axes=(-2,))
             elif len(rhs_result_dim) == 0:
-                idx_result = mb.squeeze(x=idx_result, axes=(-1))
+                idx_result = mb.squeeze(x=idx_result, axes=(-1,))
 
             # TODO: Consider making this work on iOS<18 by using concatenation
-            update_tensor_by_slice(result, batch_selector + result_idx, idx_result)
+            result = update_tensor_by_slice(result, batch_selector + result_idx, idx_result)
 
-        return result
+        context.add_variable(op.result.get_name(), result)
 
 
     @register_stablehlo_op
@@ -549,7 +549,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_compare(self, context: TranscriptionContext, op: CompareOp):
-        comparison_direction = self.__hacky_parse_attribute(op.comparison_direction)["comparison_direction"]
+        comparison_direction = hlo.ComparisonDirectionAttr(op.comparison_direction).value
         cml_op_builder = {
             "EQ": mb.equal,
             "NE": mb.not_equal,
@@ -632,15 +632,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_convolution(self, context: TranscriptionContext, op: ConvolutionOp):
         # TODO(knielsen): Support additional dimension specifications
-        dim_spec = self.__hacky_parse_conv_dimensions(op.dimension_numbers)
-        if dim_spec.in_dim[0] != "b" or dim_spec.out_dim[0] != "b":
+        dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
+        if dim_spec.input_batch_dimension != 0 or dim_spec.output_batch_dimension != 0:
             raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
-        if dim_spec.in_dim[1] != "0" or dim_spec.out_dim[1] != "0" or dim_spec.weights_dim[0] != "0":
-            raise ValueError(f"This must currently be 0. Not totally sure what it exactly means. Got {dim_spec}")
-        if dim_spec.weights_dim[-1] != "o":
-            raise ValueError(f"The output channels dim must be the last weight dimension. Got {dim_spec}")
-        if dim_spec.weights_dim[-2] != "i":
-            raise ValueError(f"The input channels dim must be the second last weight dimension. Got {dim_spec}")
+        if dim_spec.input_feature_dimension != 2:
+            raise ValueError("Only dimension 2 is currently supported as input feature dimension")
+        if dim_spec.output_feature_dimension != 2:
+            raise ValueError("Only dimension 2 is currently supported as output feature dimension")
 
         if op.batch_group_count.value != 1:
             raise ValueError(f"Only a batch group count of 1 is supported. Got {op.batch_group_count.value}")
@@ -785,45 +783,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.pop_function()
 
         return outputs
-
-    # TODO(knielsen): Figure out a way to get rid of this!!!
-    def __hacky_parse_attribute(self, attr: ir.Attribute):
-        attr_str = str(attr)
-        start = attr_str.find("<")
-        end = attr_str.rfind(">")
-        if start == -1 or end == -1:
-            return {}
-
-        attr_str = attr_str[(start + 1):end]
-    
-        attributes = {}
-        # Split the string by comma to separate each key-value pair
-        for attribute in attr_str.split(','):
-            if "=" in attribute:
-                # Split by '=' to separate keys and values
-                key, value = attribute.split('=')
-            else:
-                # Assume space seperated
-                key, value = attribute.split(' ')
-        
-            # Remove extra spaces and strip brackets
-            key = key.strip()
-            value = value.strip()
-            attributes[key] = value
-
-        return attributes
-
-    def __hacky_parse_conv_dimensions(self, attr):
-        # Example form: #stablehlo.conv<[b, 0, f]x[0, i, o]->[b, 0, f]>
-        s = str(attr)
-
-        matches = re.findall(r'\[([^\[\]]+)\]', s)
-        lists = [ match.split(', ') for match in matches ]
-        return ConvDimensions(
-            in_dim=lists[0],
-            weights_dim=lists[1],
-            out_dim=lists[2],
-        )
 
     def __resolve_type(self, obj):
         if isinstance(obj, np.ndarray):
